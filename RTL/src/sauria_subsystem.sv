@@ -175,6 +175,8 @@ AXI_BUS #(
 	dma_ext_mem(),
 	gather_ext_mem(),
 	gather_sauria_mem(),
+	runtime_mem_sauria(),
+	debug_mem_sauria_gated(),
 	
 	core_mem_mux[1:0]();
 
@@ -451,16 +453,45 @@ axi_mux_intf #(
 );
 
 // ------------------------------------------------------------
-// Local SAURIA SRAM mux: Gather vs DMA
+// Local SAURIA SRAM path
 // ------------------------------------------------------------
+// The gather has strict priority while gather_busy is high.  The dedicated
+// mux locks the owner for the complete AXI transaction, therefore a DMA burst
+// already accepted before gather_busy rises is allowed to drain safely.
+// New debug requests are blocked while the gather is busy.
 
 logic use_gather_sram;
-
 assign use_gather_sram = gather_busy;
 
+axi_busy_priority_mux #(
+    .AXI_ADDR_WIDTH (DATA_AXI_ADDR_WIDTH),
+    .AXI_DATA_WIDTH (DATA_AXI_DATA_WIDTH),
+    .AXI_ID_WIDTH   (DATA_AXI_ID_WIDTH),
+    .AXI_USER_WIDTH (1)
+) gather_dma_sram_mux_i (
+    .clk_i          (i_system_clk),
+    .rst_ni         (i_system_rstn),
+    .priority_i     (use_gather_sram),
+    .low_prio_slv   (dma_mem_sauria),
+    .high_prio_slv  (gather_sauria_mem),
+    .mst            (runtime_mem_sauria)
+);
 
-`AXI_ASSIGN(core_mem_mux[0], 	dma_mem_sauria)
-`AXI_ASSIGN(core_mem_mux[1],    debug_mem_sauria)
+axi_request_gate #(
+    .AXI_ADDR_WIDTH (DATA_AXI_ADDR_WIDTH),
+    .AXI_DATA_WIDTH (DATA_AXI_DATA_WIDTH),
+    .AXI_ID_WIDTH   (DATA_AXI_ID_WIDTH),
+    .AXI_USER_WIDTH (1)
+) debug_sram_gate_i (
+    .clk_i          (i_system_clk),
+    .rst_ni         (i_system_rstn),
+    .enable_i       (!use_gather_sram),
+    .slv            (debug_mem_sauria),
+    .mst            (debug_mem_sauria_gated)
+);
+
+`AXI_ASSIGN(core_mem_mux[0], runtime_mem_sauria)
+`AXI_ASSIGN(core_mem_mux[1], debug_mem_sauria_gated)
 
 // ------------------------------------------------------------
 // CLOCK DOMAIN CROSSINGS (CDCs)
@@ -570,7 +601,7 @@ gather_frontend_axi #(
   .DATA_AXI_ADDR_WIDTH  (DATA_AXI_ADDR_WIDTH),
   .DATA_AXI_ID_WIDTH    (DATA_AXI_ID_WIDTH),
 
-  .ByteWidth            (16), 
+  .ByteWidth            (sauria_pkg::IA_W),
   .ByteWidth_idx        (32),
   .N_BLOCKS             (sauria_pkg::Y)              
 ) gather_frontend_i (
@@ -606,19 +637,19 @@ sauria_core #(
 );
 
 // ------------------------------------------------------------
-// External AXI memory mux: Gather vs DMA
+// External AXI memory mux: Gather reads DRAM, DMA owns DRAM otherwise
 // ------------------------------------------------------------
-// Prima versione: mutual exclusive.
-// Software deve garantire che gather e DMA non siano attivi insieme.
+// During gather_busy:
+//   * AR/R are connected to gather_ext_mem.
+//   * DMA AR/R and AW/W/B are stalled.
+//   * gather_sauria_mem is NOT connected here; it writes the local SRAM path.
 
 logic use_gather_mem;
-
 assign use_gather_mem = gather_busy;
 
 // -------------------------
 // AR channel
 // -------------------------
-
 assign io_mem_port.ar_id     = use_gather_mem ? gather_ext_mem.ar_id     : dma_ext_mem.ar_id;
 assign io_mem_port.ar_addr   = use_gather_mem ? gather_ext_mem.ar_addr   : dma_ext_mem.ar_addr;
 assign io_mem_port.ar_len    = use_gather_mem ? gather_ext_mem.ar_len    : dma_ext_mem.ar_len;
@@ -638,7 +669,6 @@ assign dma_ext_mem.ar_ready    = use_gather_mem ? 1'b0                 : io_mem_
 // -------------------------
 // R channel
 // -------------------------
-
 assign gather_ext_mem.r_id    = io_mem_port.r_id;
 assign gather_ext_mem.r_data  = io_mem_port.r_data;
 assign gather_ext_mem.r_resp  = io_mem_port.r_resp;
@@ -655,68 +685,64 @@ assign dma_ext_mem.r_valid    = use_gather_mem ? 1'b0 : io_mem_port.r_valid;
 
 assign io_mem_port.r_ready    = use_gather_mem ? gather_ext_mem.r_ready : dma_ext_mem.r_ready;
 
-// AW channel: durante gather usa gather_sauria_mem, non gather_ext_mem
-assign io_mem_port.aw_id     = use_gather_mem ? gather_sauria_mem.aw_id     : dma_ext_mem.aw_id;
-assign io_mem_port.aw_addr   = use_gather_mem ? gather_sauria_mem.aw_addr   : dma_ext_mem.aw_addr;
-assign io_mem_port.aw_len    = use_gather_mem ? gather_sauria_mem.aw_len    : dma_ext_mem.aw_len;
-assign io_mem_port.aw_size   = use_gather_mem ? gather_sauria_mem.aw_size   : dma_ext_mem.aw_size;
-assign io_mem_port.aw_burst  = use_gather_mem ? gather_sauria_mem.aw_burst  : dma_ext_mem.aw_burst;
-assign io_mem_port.aw_lock   = use_gather_mem ? gather_sauria_mem.aw_lock   : dma_ext_mem.aw_lock;
-assign io_mem_port.aw_cache  = use_gather_mem ? gather_sauria_mem.aw_cache  : dma_ext_mem.aw_cache;
-assign io_mem_port.aw_prot   = use_gather_mem ? gather_sauria_mem.aw_prot   : dma_ext_mem.aw_prot;
-assign io_mem_port.aw_qos    = use_gather_mem ? gather_sauria_mem.aw_qos    : dma_ext_mem.aw_qos;
-assign io_mem_port.aw_region = use_gather_mem ? gather_sauria_mem.aw_region : dma_ext_mem.aw_region;
-assign io_mem_port.aw_user   = use_gather_mem ? gather_sauria_mem.aw_user   : dma_ext_mem.aw_user;
-assign io_mem_port.aw_valid  = use_gather_mem ? gather_sauria_mem.aw_valid  : dma_ext_mem.aw_valid;
+// -------------------------
+// AW channel: external writes belong only to the DMA
+// -------------------------
+assign io_mem_port.aw_id     = dma_ext_mem.aw_id;
+assign io_mem_port.aw_addr   = dma_ext_mem.aw_addr;
+assign io_mem_port.aw_len    = dma_ext_mem.aw_len;
+assign io_mem_port.aw_size   = dma_ext_mem.aw_size;
+assign io_mem_port.aw_burst  = dma_ext_mem.aw_burst;
+assign io_mem_port.aw_lock   = dma_ext_mem.aw_lock;
+assign io_mem_port.aw_cache  = dma_ext_mem.aw_cache;
+assign io_mem_port.aw_prot   = dma_ext_mem.aw_prot;
+assign io_mem_port.aw_qos    = dma_ext_mem.aw_qos;
+assign io_mem_port.aw_region = dma_ext_mem.aw_region;
+assign io_mem_port.aw_atop   = dma_ext_mem.aw_atop;
+assign io_mem_port.aw_user   = dma_ext_mem.aw_user;
+assign io_mem_port.aw_valid  = !use_gather_mem && dma_ext_mem.aw_valid;
 
-assign gather_ext_mem.aw_ready    = 1'b0;
-assign gather_sauria_mem.aw_ready = use_gather_mem ? io_mem_port.aw_ready : 1'b0;
-assign dma_ext_mem.aw_ready       = use_gather_mem ? 1'b0 : io_mem_port.aw_ready;
+assign dma_ext_mem.aw_ready  = !use_gather_mem && io_mem_port.aw_ready;
 
-// W channel
-assign io_mem_port.w_data  = use_gather_mem ? gather_sauria_mem.w_data  : dma_ext_mem.w_data;
-assign io_mem_port.w_strb  = use_gather_mem ? gather_sauria_mem.w_strb  : dma_ext_mem.w_strb;
-assign io_mem_port.w_last  = use_gather_mem ? gather_sauria_mem.w_last  : dma_ext_mem.w_last;
-assign io_mem_port.w_user  = use_gather_mem ? gather_sauria_mem.w_user  : dma_ext_mem.w_user;
-assign io_mem_port.w_valid = use_gather_mem ? gather_sauria_mem.w_valid : dma_ext_mem.w_valid;
+// -------------------------
+// W channel: external writes belong only to the DMA
+// -------------------------
+assign io_mem_port.w_data    = dma_ext_mem.w_data;
+assign io_mem_port.w_strb    = dma_ext_mem.w_strb;
+assign io_mem_port.w_last    = dma_ext_mem.w_last;
+assign io_mem_port.w_user    = dma_ext_mem.w_user;
+assign io_mem_port.w_valid   = !use_gather_mem && dma_ext_mem.w_valid;
 
-assign gather_ext_mem.w_ready    = 1'b0;
-assign gather_sauria_mem.w_ready = use_gather_mem ? io_mem_port.w_ready : 1'b0;
-assign dma_ext_mem.w_ready       = use_gather_mem ? 1'b0 : io_mem_port.w_ready;
+assign dma_ext_mem.w_ready   = !use_gather_mem && io_mem_port.w_ready;
 
-// B channel: la risposta write deve tornare a gather_sauria_mem
-assign gather_ext_mem.b_valid = 1'b0;
-assign gather_ext_mem.b_id    = '0;
-assign gather_ext_mem.b_resp  = '0;
-assign gather_ext_mem.b_user  = '0;
+// -------------------------
+// B channel: external write response belongs only to the DMA
+// -------------------------
+assign dma_ext_mem.b_id      = io_mem_port.b_id;
+assign dma_ext_mem.b_resp    = io_mem_port.b_resp;
+assign dma_ext_mem.b_user    = io_mem_port.b_user;
+assign dma_ext_mem.b_valid   = !use_gather_mem && io_mem_port.b_valid;
+assign io_mem_port.b_ready   = !use_gather_mem && dma_ext_mem.b_ready;
 
-assign gather_sauria_mem.b_id    = io_mem_port.b_id;
-assign gather_sauria_mem.b_resp  = io_mem_port.b_resp;
-assign gather_sauria_mem.b_user  = io_mem_port.b_user;
-assign gather_sauria_mem.b_valid = use_gather_mem ? io_mem_port.b_valid : 1'b0;
-
-assign dma_ext_mem.b_id       = io_mem_port.b_id;
-assign dma_ext_mem.b_resp     = io_mem_port.b_resp;
-assign dma_ext_mem.b_user     = io_mem_port.b_user;
-assign dma_ext_mem.b_valid    = use_gather_mem ? 1'b0 : io_mem_port.b_valid;
-
-assign io_mem_port.b_ready = use_gather_mem ? gather_sauria_mem.b_ready : dma_ext_mem.b_ready;
-
-assign gather_sauria_mem.r_id    = '0;
-assign gather_sauria_mem.r_data  = '0;
-assign gather_sauria_mem.r_resp  = '0;
-assign gather_sauria_mem.r_last  = 1'b0;
-assign gather_sauria_mem.r_user  = '0;
-assign gather_sauria_mem.r_valid = 1'b0;
-
+// gather_ext_mem is read-only.
 assign gather_ext_mem.aw_ready = 1'b0;
 assign gather_ext_mem.w_ready  = 1'b0;
+assign gather_ext_mem.b_valid  = 1'b0;
+assign gather_ext_mem.b_id     = '0;
+assign gather_ext_mem.b_resp   = axi_pkg::RESP_OKAY;
+assign gather_ext_mem.b_user   = '0;
 
-assign gather_ext_mem.b_valid = 1'b0;
-assign gather_ext_mem.b_id    = '0;
-assign gather_ext_mem.b_resp  = '0;
-assign gather_ext_mem.b_user  = '0;
-
-
+// Catch a wrong software destination early: the gather output must target
+// SRAM A (fmap), whose local address window starts at SRAMA_OFFSET.
+`ifndef SYNTHESIS
+always_ff @(posedge i_system_clk) begin
+    if (i_system_rstn && gather_sauria_mem.aw_valid && gather_sauria_mem.aw_ready) begin
+        assert ((gather_sauria_mem.aw_addr & sauria_addr_pkg::SAURIA_MEM_ADDR_MASK)
+                == sauria_addr_pkg::SRAMA_OFFSET)
+            else $error("Gather AW address is not inside SAURIA SRAM A: %h",
+                        gather_sauria_mem.aw_addr);
+    end
+end
+`endif
 
 endmodule 

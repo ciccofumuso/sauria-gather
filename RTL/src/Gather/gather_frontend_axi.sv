@@ -411,37 +411,12 @@ logic       b_valid;
 logic       b_ready;
 
 // ---------------------------------------------------------------------
-// Read/write arbitration for single-port or non-full-duplex memory models
+// DRAM read and local-SRAM write are independent paths
 // ---------------------------------------------------------------------
-// In the SAURIA DRAM-writeback integration, ext_mst.AR/R and
-// sauria_mst.AW/W/B can be routed to the same external memory port.
-// Some testbench memories accept AXI read and write handshakes in the
-// same cycle but cannot actually serve them concurrently.
-//
-// Give priority to the gather write path and stall the gather read path
-// while a write transaction is requested/in flight. This prevents cycles
-// with ext_mst.R handshake and sauria_mst.W handshake at the same time.
-logic write_active_q;
-logic write_block_read;
-logic write_start_fire;
-logic write_done_fire;
-
-assign write_start_fire = aw_valid && aw_ready;
-assign write_done_fire  = b_valid  && b_ready;
-
-always_ff @(posedge i_clk or negedge i_rstn) begin
-	if (!i_rstn) begin
-		write_active_q <= 1'b0;
-	end else begin
-		if (write_start_fire) begin
-			write_active_q <= 1'b1;
-		end else if (write_done_fire) begin
-			write_active_q <= 1'b0;
-		end
-	end
-end
-
-assign write_block_read = write_active_q || aw_valid || w_valid || b_valid;
+// In the SRAM-write integration, ext_mst serves only AR/R towards DRAM,
+// while sauria_mst serves only AW/W/B towards SAURIA local memories.
+// Therefore the old read-vs-write interlock is unnecessary and would only
+// serialize two independent interfaces.
 
 // ---------------------------------------------------------------------
 // Istanza del tuo acceleratore
@@ -516,8 +491,8 @@ assign ext_mst.ar_addr   = ar_addr_out;
 assign ext_mst.ar_len    = ar_len_out;
 assign ext_mst.ar_size   = ar_size_out;
 assign ext_mst.ar_burst  = axi_pkg::burst_t'(ar_burst);
-assign ext_mst.ar_valid  = ar_valid && !write_block_read;
-assign ar_ready          = ext_mst.ar_ready && !write_block_read;
+assign ext_mst.ar_valid  = ar_valid;
+assign ar_ready          = ext_mst.ar_ready;
 
 assign ext_mst.ar_prot   = '0;
 assign ext_mst.ar_lock   = '0;
@@ -528,9 +503,9 @@ assign ext_mst.ar_user   = '0;
 
 // Read data channel
 assign data_in           = ext_mst.r_data;
-assign r_valid           = ext_mst.r_valid && !write_block_read;
-assign r_last            = ext_mst.r_last  && !write_block_read;
-assign ext_mst.r_ready   = r_ready && !write_block_read;
+assign r_valid           = ext_mst.r_valid;
+assign r_last            = ext_mst.r_last;
+assign ext_mst.r_ready   = r_ready;
 
 // Write address channel
 assign ext_mst.aw_id     = '0;
@@ -544,6 +519,7 @@ assign ext_mst.aw_lock   = '0;
 assign ext_mst.aw_cache  = '0;
 assign ext_mst.aw_qos    = '0;
 assign ext_mst.aw_region = '0;
+assign ext_mst.aw_atop   = '0;
 assign ext_mst.aw_user   = '0;
 
 assign ext_mst.w_data    = '0;
@@ -571,6 +547,7 @@ assign sauria_mst.aw_lock   = '0;
 assign sauria_mst.aw_cache  = '0;
 assign sauria_mst.aw_qos    = '0;
 assign sauria_mst.aw_region = '0;
+assign sauria_mst.aw_atop   = '0;
 assign sauria_mst.aw_user   = '0;
 
 assign sauria_mst.w_data    = w_data;

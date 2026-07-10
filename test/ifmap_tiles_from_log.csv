@@ -1,1 +1,0 @@
-logical_tile_id,dram_start_addr_hex,size_bytes,size_fp16,num_axi_bursts,axi_burst_addrs_hex,axi_burst_sizes_bytes,axi_read_indices

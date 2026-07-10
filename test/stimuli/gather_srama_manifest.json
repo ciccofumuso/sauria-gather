@@ -1,0 +1,22 @@
+{
+  "mode": "gather_dram_read_to_srama_then_sauria_keep_a",
+  "n_values": 128,
+  "n_dense_cols": 128,
+  "gathered_nbytes": 256,
+  "ifmap_dram_base": "0x00000000",
+  "dense_stage_base": "0x00090000",
+  "comp_base": "0x00091000",
+  "idx_base": "0x00092000",
+  "srama_addr": "0x00040000",
+  "idx_extra_beats": 1,
+  "metadata": {
+    "comp_beats": 2,
+    "idx_natural_beats": 64,
+    "idx_total_beats": 65
+  },
+  "keep_a_flag_rows_patched": 1,
+  "gather_rows_inserted": 21,
+  "perf_reads_enabled": true,
+  "input_dir": "/home/henry/sauria/test/stimuli_vanilla_for_gather_sram",
+  "output_dir": "/home/henry/sauria/test/stimuli"
+}
