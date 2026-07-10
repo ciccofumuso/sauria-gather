@@ -45,5 +45,9 @@ package sauria_addr_pkg;
 
     parameter SAURIA_MEM_ADDR_MASK          = 32'h003C_0000;
     parameter SAURIA_REG_ADDR_MASK          = 32'h000F_FE00;
+	
+	// Gather Address
+	parameter GATHER_OFFSET        = 32'h7000_0000;
+	parameter AXI_GATHER_ADDR_MASK = 32'hFFFF_FF00;
 
 endpackage

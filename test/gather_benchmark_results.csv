@@ -1,0 +1,3 @@
+label,mode,n_values,n_dense_cols,gather_cycles,rd_cycles,wr_cycles,r_stall,w_stall,r_beats,w_beats,gather_done_cycle_from_log,benchmark_cycle,status,timeout,read_bytes,write_bytes,total_gather_bytes,read_B_per_cycle,write_B_per_cycle,total_B_per_cycle
+gather_only_n512,gather_only,512,512,2027,1601,152,1206,0,387,128,20670,21081,pass,False,3096,1024,4120,1.5273803650715343,0.5051800690675876,2.0325604341391217
+gather_plus_sauria_n512,gather_plus_sauria,512,512,2027,1601,152,1206,0,387,128,20670,40291,pass,False,3096,1024,4120,1.5273803650715343,0.5051800690675876,2.0325604341391217

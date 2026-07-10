@@ -1163,9 +1163,9 @@ def estimate_stalls(SA_Param_dict, silent=False):
     
     # Row & column masks generation
     rows_active_str = '0b'
-    rows_active_arr = np.zeros((size_Y), dtype=np.bool)
+    rows_active_arr = np.zeros((size_Y), dtype=bool)
     cols_active_str = '0b'
-    cols_active_arr = np.zeros((size_X), dtype=np.bool)
+    cols_active_arr = np.zeros((size_X), dtype=bool)
     
     for j in range(size_Y):
         if (j<n_rows):

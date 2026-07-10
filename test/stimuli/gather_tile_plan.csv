@@ -1,0 +1,2 @@
+tile_id,dense_base,out_base,n_values,n_dense_cols,bytes_written
+0,0x00090000,0x00000000,512,512,1024

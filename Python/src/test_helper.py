@@ -401,7 +401,7 @@ def extend_random_tests(TESTS, TILEINFO, random_tests, max_tiles=10):
         n_tiles = np.random.randint(low=1, high=max_tiles+1)
         
         # Obtain 4 numbers that multiplied will be smaller or equal to n_tiles
-        rand_array = np.zeros((4), dtype=np.int)
+        rand_array = np.zeros((4), dtype=int)
         rand_array[0] = np.random.randint(low=1, high=max(2,np.ceil(n_tiles/2)))
         remaining_max = max(np.floor(n_tiles/rand_array[0]), 1)
         for i in range(3):

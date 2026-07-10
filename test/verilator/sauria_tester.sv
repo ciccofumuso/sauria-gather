@@ -61,7 +61,8 @@ module sauria_tester(
 
     output logic        ctrl_interrupt,
     output logic        sauria_interrupt,
-    output logic        dma_interrupt
+    output logic        dma_interrupt,
+	output logic 		gather_interrupt
 );
 
 	// ------------
@@ -236,7 +237,8 @@ module sauria_tester(
 
         .o_intr                 (ctrl_interrupt),
         .o_writer_dmaintr       (dma_interrupt),
-        .o_sauriaintr           (sauria_interrupt)
+        .o_sauriaintr           (sauria_interrupt),
+		.o_gatherintr 			(gather_interrupt)
     );
 
     // Mult factor of 10 ensures that 1st decimal place of BW divider will be respected.
@@ -249,7 +251,16 @@ module sauria_tester(
 
     initial begin
         assert (DATA_AXI_DATA_WIDTH >= DRAM_BANDWIDTH) else $fatal("DATA_AXI_DATA_WIDTH (%d) must be >= than DRAM_BANDWIDTH (%d) !!!", DATA_AXI_DATA_WIDTH, DRAM_BANDWIDTH);
-    end
+		
+		assert (DATA_AXI_DATA_WIDTH % 8 == 0)
+		else $fatal(1, "DATA_AXI_DATA_WIDTH must be byte-aligned");
+
+		assert (DATA_AXI_DATA_WIDTH % sauria_pkg::DATA_ELM_BITS == 0)
+		else $fatal(1, "DATA_AXI_DATA_WIDTH must be a multiple of DATA_ELM_BITS");
+
+		assert (DATA_AXI_DATA_WIDTH >= CFG_AXI_DATA_WIDTH)
+		else $fatal(1, "DATA_AXI_DATA_WIDTH should be >= CFG_AXI_DATA_WIDTH for the debug/data width conversion path");
+	end
 
     // AXI Delayer - Enforces Bandwidth limitations
     axi_delayer #(
@@ -302,7 +313,8 @@ module sauria_tester(
 
     integer         n_errs, n_errs_prev;
     logic [7:0]     gold_dram[dat_addr_t];
-
+	
+	
     // Load memories
     initial begin: data_load_check
         $readmemh({`STIMULI_PATH,"/initial_dram.txt"}, i_sim_mem_0.mem, DRAM_OFFSET);

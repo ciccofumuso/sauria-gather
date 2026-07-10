@@ -32,7 +32,7 @@
 module sauria_subsystem #(
     parameter CFG_AXI_DATA_WIDTH    = 32,       // Configuration AXI4-Lite Slave data width
     parameter CFG_AXI_ADDR_WIDTH    = 32,       // Configuration AXI4-Lite Slave address width
-    parameter DATA_AXI_DATA_WIDTH   = 1024,     // Data AXI4 Slave data width
+    parameter DATA_AXI_DATA_WIDTH   = 64,     // Data AXI4 Slave data width
     parameter DATA_AXI_ADDR_WIDTH   = 32,       // Data AXI4 Slave address width
     parameter DATA_AXI_ID_WIDTH      = 2,       // Data AXI4 Slave ID width
     
@@ -126,12 +126,18 @@ module sauria_subsystem #(
     output logic                                o_writer_dmaintr,       // DMA writer completion interrupt
     
     // SAURIA Interrupt
-    output logic                                o_sauriaintr            // SAURIA core completion interrupt
+    output logic                                o_sauriaintr,            // SAURIA core completion interrupt
+	
+	// GATHER Interrupt
+	output logic 								o_gatherintr
 );
 
 // ------------------------------------------------------------
 // Signals
 // ------------------------------------------------------------
+
+logic gather_doneintr;
+logic gather_busy;
 
 // Interrupts
 logic       sauria_intr2cdc, sauria_intr2control, dma_rd_intr2control, dma_wr_intr2control;
@@ -142,11 +148,14 @@ AXI_LITE #(
   .AXI_DATA_WIDTH (CFG_AXI_DATA_WIDTH)
 )   io_cfg_port(),                                                      // FROM IOs
     cfg_controller(),cfg_sauria_core(),cfg_udma(),cfg_mem_debug(),      // FROM io_cfg_port() VIA DEMUX
-    ctrl_sauria_core(),ctrl_udma(),                                     // FROM DF CONTROLLER
+    
+	cfg_gather(),
+	
+	ctrl_sauria_core(),ctrl_udma(),                                     // FROM DF CONTROLLER
     udma_cfg_port(),                                                    // UDMA PORT
     sauria_cfg_port_HF(),sauria_cfg_port_LF(),                          // SAURIA PORT, PRE- AND POST-CDC
     err_slv_lite(),                                                     // AXI Lite Error Slave
-    cfg_demux[4:0](), core_cfg_mux[1:0](), dma_cfg_mux[1:0]();
+    cfg_demux[5:0](), core_cfg_mux[1:0](), dma_cfg_mux[1:0]();
 
 // AXI4 Lite Interfaces (Intermediate step on Lite->Full conversion)
 AXI_LITE #(
@@ -162,7 +171,12 @@ AXI_BUS #(
   .AXI_USER_WIDTH (1) // Unused, but 0 can cause compilation errors
 )   io_mem_port(),                                                      // TO IOs
     dma_mem_sauria(),debug_mem_sauria(),                                // TO SAURIA LOCAL MEMORIES
-    core_mem_mux[1:0]();
+    
+	dma_ext_mem(),
+	gather_ext_mem(),
+	gather_sauria_mem(),
+	
+	core_mem_mux[1:0]();
 
 // AXI4 Interfaces (Slaves)
 AXI_BUS #(
@@ -260,7 +274,7 @@ logic [2:0] lite_demx_aw_sel, lite_demx_ar_sel;
 axi_lite_demux_intf #(
     .AxiAddrWidth   (CFG_AXI_ADDR_WIDTH),
     .AxiDataWidth   (CFG_AXI_DATA_WIDTH),
-    .NoMstPorts     (5),
+    .NoMstPorts     (6),
     .MaxTrans       (8),
     .SpillAw        (1'b1),     // Add spill registers (+1 latency)
     .SpillW         (1'b1),
@@ -281,14 +295,15 @@ axi_lite_demux_intf #(
 `AXI_LITE_ASSIGN(cfg_udma,          cfg_demux[1])
 `AXI_LITE_ASSIGN(cfg_sauria_core,   cfg_demux[2]) 
 `AXI_LITE_ASSIGN(cfg_mem_debug,     cfg_demux[3])
-`AXI_LITE_ASSIGN(err_slv_lite,      cfg_demux[4]) 
+`AXI_LITE_ASSIGN(cfg_gather,      	cfg_demux[4])
+`AXI_LITE_ASSIGN(err_slv_lite,      cfg_demux[5]) 
 
 // Demux Control
 always_comb begin : demux_sel
     
     // Default to zero (DF Controller)
-    lite_demx_aw_sel = 3'd4;
-    lite_demx_ar_sel = 3'd4;
+    lite_demx_aw_sel = 3'd5;
+    lite_demx_ar_sel = 3'd5;
 
     // AW - Controller region
     if      ((io_cfg_port.aw_addr & sauria_addr_pkg::AXI_CONTROLLER_ADDR_MASK) == sauria_addr_pkg::CONTROLLER_OFFSET)
@@ -306,6 +321,10 @@ always_comb begin : demux_sel
         else
             lite_demx_aw_sel = 3'd3;
     end
+	// AW - Gather region
+	else if ((io_cfg_port.aw_addr & sauria_addr_pkg::AXI_GATHER_ADDR_MASK) == sauria_addr_pkg::GATHER_OFFSET) begin
+	  lite_demx_aw_sel = 3'd4;
+	end
 
     // AR - Controller region
     if      ((io_cfg_port.ar_addr & sauria_addr_pkg::AXI_CONTROLLER_ADDR_MASK) == sauria_addr_pkg::CONTROLLER_OFFSET)
@@ -323,6 +342,10 @@ always_comb begin : demux_sel
         else
             lite_demx_ar_sel = 3'd3;
     end
+	// AR - Gather region
+	else if ((io_cfg_port.ar_addr & sauria_addr_pkg::AXI_GATHER_ADDR_MASK) == sauria_addr_pkg::GATHER_OFFSET) begin
+	  lite_demx_ar_sel = 3'd4;
+	end
 end
 
 // Error slave to catch unmapped addresses
@@ -427,8 +450,17 @@ axi_mux_intf #(
     .mst                (sauria_mem_port_HF)
 );
 
-`AXI_ASSIGN(core_mem_mux[0],   dma_mem_sauria)
-`AXI_ASSIGN(core_mem_mux[1],   debug_mem_sauria)
+// ------------------------------------------------------------
+// Local SAURIA SRAM mux: Gather vs DMA
+// ------------------------------------------------------------
+
+logic use_gather_sram;
+
+assign use_gather_sram = gather_busy;
+
+
+`AXI_ASSIGN(core_mem_mux[0], 	dma_mem_sauria)
+`AXI_ASSIGN(core_mem_mux[1],    debug_mem_sauria)
 
 // ------------------------------------------------------------
 // CLOCK DOMAIN CROSSINGS (CDCs)
@@ -524,11 +556,37 @@ dma_top #(
 
     .cfg_slv            (udma_cfg_port),
     .sauria_mst         (dma_mem_sauria),
-    .mem_mst            (io_mem_port),
+    .mem_mst            (dma_ext_mem),
 
     .o_reader_dmaintr   (dma_rd_intr2control),
     .o_writer_dmaintr   (dma_wr_intr2control)
 );
+
+// Istanza Gather Unit
+gather_frontend_axi #(
+  .CFG_AXI_DATA_WIDTH   (CFG_AXI_DATA_WIDTH),
+  .CFG_AXI_ADDR_WIDTH   (CFG_AXI_ADDR_WIDTH),
+  .DATA_AXI_DATA_WIDTH  (DATA_AXI_DATA_WIDTH),
+  .DATA_AXI_ADDR_WIDTH  (DATA_AXI_ADDR_WIDTH),
+  .DATA_AXI_ID_WIDTH    (DATA_AXI_ID_WIDTH),
+
+  .ByteWidth            (16), 
+  .ByteWidth_idx        (32),
+  .N_BLOCKS             (sauria_pkg::Y)              
+) gather_frontend_i (
+  .i_clk       (i_system_clk),
+  .i_rstn      (i_system_rstn),
+
+  .cfg_slv     (cfg_gather),
+
+  .ext_mst     (gather_ext_mem),
+  .sauria_mst  (gather_sauria_mem),
+
+  .o_doneintr  (gather_doneintr),
+  .o_busy      (gather_busy)
+);
+
+assign o_gatherintr = gather_doneintr;
 
 // SAURIA Core
 sauria_core #(
@@ -546,5 +604,119 @@ sauria_core #(
 
     .o_doneintr (sauria_intr2cdc)
 );
+
+// ------------------------------------------------------------
+// External AXI memory mux: Gather vs DMA
+// ------------------------------------------------------------
+// Prima versione: mutual exclusive.
+// Software deve garantire che gather e DMA non siano attivi insieme.
+
+logic use_gather_mem;
+
+assign use_gather_mem = gather_busy;
+
+// -------------------------
+// AR channel
+// -------------------------
+
+assign io_mem_port.ar_id     = use_gather_mem ? gather_ext_mem.ar_id     : dma_ext_mem.ar_id;
+assign io_mem_port.ar_addr   = use_gather_mem ? gather_ext_mem.ar_addr   : dma_ext_mem.ar_addr;
+assign io_mem_port.ar_len    = use_gather_mem ? gather_ext_mem.ar_len    : dma_ext_mem.ar_len;
+assign io_mem_port.ar_size   = use_gather_mem ? gather_ext_mem.ar_size   : dma_ext_mem.ar_size;
+assign io_mem_port.ar_burst  = use_gather_mem ? gather_ext_mem.ar_burst  : dma_ext_mem.ar_burst;
+assign io_mem_port.ar_lock   = use_gather_mem ? gather_ext_mem.ar_lock   : dma_ext_mem.ar_lock;
+assign io_mem_port.ar_cache  = use_gather_mem ? gather_ext_mem.ar_cache  : dma_ext_mem.ar_cache;
+assign io_mem_port.ar_prot   = use_gather_mem ? gather_ext_mem.ar_prot   : dma_ext_mem.ar_prot;
+assign io_mem_port.ar_qos    = use_gather_mem ? gather_ext_mem.ar_qos    : dma_ext_mem.ar_qos;
+assign io_mem_port.ar_region = use_gather_mem ? gather_ext_mem.ar_region : dma_ext_mem.ar_region;
+assign io_mem_port.ar_user   = use_gather_mem ? gather_ext_mem.ar_user   : dma_ext_mem.ar_user;
+assign io_mem_port.ar_valid  = use_gather_mem ? gather_ext_mem.ar_valid  : dma_ext_mem.ar_valid;
+
+assign gather_ext_mem.ar_ready = use_gather_mem ? io_mem_port.ar_ready : 1'b0;
+assign dma_ext_mem.ar_ready    = use_gather_mem ? 1'b0                 : io_mem_port.ar_ready;
+
+// -------------------------
+// R channel
+// -------------------------
+
+assign gather_ext_mem.r_id    = io_mem_port.r_id;
+assign gather_ext_mem.r_data  = io_mem_port.r_data;
+assign gather_ext_mem.r_resp  = io_mem_port.r_resp;
+assign gather_ext_mem.r_last  = io_mem_port.r_last;
+assign gather_ext_mem.r_user  = io_mem_port.r_user;
+assign gather_ext_mem.r_valid = use_gather_mem ? io_mem_port.r_valid : 1'b0;
+
+assign dma_ext_mem.r_id       = io_mem_port.r_id;
+assign dma_ext_mem.r_data     = io_mem_port.r_data;
+assign dma_ext_mem.r_resp     = io_mem_port.r_resp;
+assign dma_ext_mem.r_last     = io_mem_port.r_last;
+assign dma_ext_mem.r_user     = io_mem_port.r_user;
+assign dma_ext_mem.r_valid    = use_gather_mem ? 1'b0 : io_mem_port.r_valid;
+
+assign io_mem_port.r_ready    = use_gather_mem ? gather_ext_mem.r_ready : dma_ext_mem.r_ready;
+
+// AW channel: durante gather usa gather_sauria_mem, non gather_ext_mem
+assign io_mem_port.aw_id     = use_gather_mem ? gather_sauria_mem.aw_id     : dma_ext_mem.aw_id;
+assign io_mem_port.aw_addr   = use_gather_mem ? gather_sauria_mem.aw_addr   : dma_ext_mem.aw_addr;
+assign io_mem_port.aw_len    = use_gather_mem ? gather_sauria_mem.aw_len    : dma_ext_mem.aw_len;
+assign io_mem_port.aw_size   = use_gather_mem ? gather_sauria_mem.aw_size   : dma_ext_mem.aw_size;
+assign io_mem_port.aw_burst  = use_gather_mem ? gather_sauria_mem.aw_burst  : dma_ext_mem.aw_burst;
+assign io_mem_port.aw_lock   = use_gather_mem ? gather_sauria_mem.aw_lock   : dma_ext_mem.aw_lock;
+assign io_mem_port.aw_cache  = use_gather_mem ? gather_sauria_mem.aw_cache  : dma_ext_mem.aw_cache;
+assign io_mem_port.aw_prot   = use_gather_mem ? gather_sauria_mem.aw_prot   : dma_ext_mem.aw_prot;
+assign io_mem_port.aw_qos    = use_gather_mem ? gather_sauria_mem.aw_qos    : dma_ext_mem.aw_qos;
+assign io_mem_port.aw_region = use_gather_mem ? gather_sauria_mem.aw_region : dma_ext_mem.aw_region;
+assign io_mem_port.aw_user   = use_gather_mem ? gather_sauria_mem.aw_user   : dma_ext_mem.aw_user;
+assign io_mem_port.aw_valid  = use_gather_mem ? gather_sauria_mem.aw_valid  : dma_ext_mem.aw_valid;
+
+assign gather_ext_mem.aw_ready    = 1'b0;
+assign gather_sauria_mem.aw_ready = use_gather_mem ? io_mem_port.aw_ready : 1'b0;
+assign dma_ext_mem.aw_ready       = use_gather_mem ? 1'b0 : io_mem_port.aw_ready;
+
+// W channel
+assign io_mem_port.w_data  = use_gather_mem ? gather_sauria_mem.w_data  : dma_ext_mem.w_data;
+assign io_mem_port.w_strb  = use_gather_mem ? gather_sauria_mem.w_strb  : dma_ext_mem.w_strb;
+assign io_mem_port.w_last  = use_gather_mem ? gather_sauria_mem.w_last  : dma_ext_mem.w_last;
+assign io_mem_port.w_user  = use_gather_mem ? gather_sauria_mem.w_user  : dma_ext_mem.w_user;
+assign io_mem_port.w_valid = use_gather_mem ? gather_sauria_mem.w_valid : dma_ext_mem.w_valid;
+
+assign gather_ext_mem.w_ready    = 1'b0;
+assign gather_sauria_mem.w_ready = use_gather_mem ? io_mem_port.w_ready : 1'b0;
+assign dma_ext_mem.w_ready       = use_gather_mem ? 1'b0 : io_mem_port.w_ready;
+
+// B channel: la risposta write deve tornare a gather_sauria_mem
+assign gather_ext_mem.b_valid = 1'b0;
+assign gather_ext_mem.b_id    = '0;
+assign gather_ext_mem.b_resp  = '0;
+assign gather_ext_mem.b_user  = '0;
+
+assign gather_sauria_mem.b_id    = io_mem_port.b_id;
+assign gather_sauria_mem.b_resp  = io_mem_port.b_resp;
+assign gather_sauria_mem.b_user  = io_mem_port.b_user;
+assign gather_sauria_mem.b_valid = use_gather_mem ? io_mem_port.b_valid : 1'b0;
+
+assign dma_ext_mem.b_id       = io_mem_port.b_id;
+assign dma_ext_mem.b_resp     = io_mem_port.b_resp;
+assign dma_ext_mem.b_user     = io_mem_port.b_user;
+assign dma_ext_mem.b_valid    = use_gather_mem ? 1'b0 : io_mem_port.b_valid;
+
+assign io_mem_port.b_ready = use_gather_mem ? gather_sauria_mem.b_ready : dma_ext_mem.b_ready;
+
+assign gather_sauria_mem.r_id    = '0;
+assign gather_sauria_mem.r_data  = '0;
+assign gather_sauria_mem.r_resp  = '0;
+assign gather_sauria_mem.r_last  = 1'b0;
+assign gather_sauria_mem.r_user  = '0;
+assign gather_sauria_mem.r_valid = 1'b0;
+
+assign gather_ext_mem.aw_ready = 1'b0;
+assign gather_ext_mem.w_ready  = 1'b0;
+
+assign gather_ext_mem.b_valid = 1'b0;
+assign gather_ext_mem.b_id    = '0;
+assign gather_ext_mem.b_resp  = '0;
+assign gather_ext_mem.b_user  = '0;
+
+
 
 endmodule 

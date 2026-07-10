@@ -140,7 +140,7 @@ int main(int argc, char** argv, char** env) {
     bool check_read_values = false;
 
     uint32_t cfg_data_in, cfg_addr;
-    bool cfg_wren, cfg_rden, cfg_wait4sauria;
+    bool cfg_wren, cfg_rden, cfg_wait4sauria, cfg_wait4gather;
     bool check_flag = 0;
     bool lower_intr_flag = 0;
     uint32_t rd_databuf;
@@ -281,6 +281,7 @@ int main(int argc, char** argv, char** env) {
 
     // Initialize control variables
     cfg_wait4sauria = false;
+	cfg_wait4gather = false;
     lower_intr_flag = false;
 
     // Open file to log additional registers read from CFG interface
@@ -339,8 +340,16 @@ int main(int argc, char** argv, char** env) {
                         if (debug) std::cout << "[" << main_time << "] New test " << std::endl;
                     }
 
-                // Lowering SAURIA interrupt flag
-                } else if (lower_intr_flag) {
+                // GATHER interrupt flag
+                } else if (cfg_wait4gather) {
+					if (top->gather_interrupt) {
+						cfg_wait4gather = 0;
+						if (debug)
+							std::cout << "[" << main_time << "] Gather done." << std::endl;
+					}
+					
+				// Lowering SAURIA interrupt flag
+				} else if (lower_intr_flag) {
 
                     if (debug) std::cout << "[" << main_time << "] [CFG] Lowering SAURIA interrupt... " << (int)(top->ctrl_interrupt) << std::endl;
                     if (cfg_status==3) {
@@ -367,14 +376,17 @@ int main(int argc, char** argv, char** env) {
                     switch (StimuliArray[7*idx_cfg+4]) {
                         case 1:
                             cfg_wait4sauria = 1;
+							cfg_wait4gather = 0;
                             if (debug) std::cout << "[" << main_time << "] [CFG] Waiting 4 sauria..." << std::endl;
                             break;
                         case 2:
                             cfg_wait4sauria = 0;
-                            if (debug) std::cout << "[" << main_time << "] [CFG] Waiting 4 other IF..." << std::endl;
+							cfg_wait4gather = 1;
+                            if (debug) std::cout << "[" << main_time << "] [CFG] Waiting for Gather..." << std::endl;
                             break;
                         default:
                             cfg_wait4sauria = 0;
+							cfg_wait4gather = 0;
                             break;
                     }
 

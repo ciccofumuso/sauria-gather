@@ -302,7 +302,7 @@ def get_sauria_regs(CONV, HYPER, silent=True):
     ALL_SIGNALS = [CONTROL_SIGNALS, ACTIVATION_SIGNALS, WEIGHT_SIGNALS, OUTPUT_SIGNALS]
     
     # Compute total bits per region
-    region_bits = np.zeros((len(ALL_SIGNALS)), dtype=np.int)
+    region_bits = np.zeros((len(ALL_SIGNALS)), dtype=int)
     for r, region in enumerate(ALL_SIGNALS):
         for i, signal in enumerate(region):
             if (r==1) and (i==12):

@@ -34,7 +34,7 @@ def booth_multiplier(a, b, N_bits=16, m=16, approx=''):
     bit_groups = int(np.ceil(N_bits/2))     # Sure about the ceiling? - yah
     
     # MAKE GROUPINGS
-    groups_array = np.zeros((a.shape[0], bit_groups), dtype=np.int)
+    groups_array = np.zeros((a.shape[0], bit_groups), dtype=int)
     
     # Must handle numbers one by one, unfortunately
     for n in range(a.shape[0]):
@@ -84,7 +84,7 @@ def booth_multiplier(a, b, N_bits=16, m=16, approx=''):
             pproducts_final[:,i] = pproducts[:,i]
             
             # Sign correction
-            pproducts_final[:,i] = pproducts_final[:,i] + neg[:,i].astype(np.int)
+            pproducts_final[:,i] = pproducts_final[:,i] + neg[:,i].astype(int)
             
         # Approx type M1
         # ******************
@@ -130,7 +130,7 @@ def booth_multiplier(a, b, N_bits=16, m=16, approx=''):
             
             # Sign correction (only in fully approx)
             if (approx_boundary == 0):
-                pproducts_final[:,i] = pproducts_final[:,i] + neg[:,i].astype(np.int)
+                pproducts_final[:,i] = pproducts_final[:,i] + neg[:,i].astype(int)
                 
         # SIGN EXTENSION BEFORE ADDITION
         first_one = np.floor(np.log2(pproducts_final[:,i] + (pproducts_final[:,i]==0)))     # ==0 is contingency to avoid log(0)

@@ -32,7 +32,7 @@ def array_multiplier(a, b, N_bits=16, hbl=3, vbl=3, corr_loc=0, signed=True):
     a_bin = np.binary_repr(a, N_bits)
     a_bin = a_bin[::-1]     # Change endianness for convenience
     
-    a_bits = np.zeros(N_bits, dtype=np.int)
+    a_bits = np.zeros(N_bits, dtype=int)
     for i in range(N_bits):
         a_bits[i] = int("0b" + a_bin[i], 2)
     

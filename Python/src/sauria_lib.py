@@ -162,9 +162,9 @@ def get_conv_dict(tensor_shapes, TILING_DICT, HOPTS, preloads=0, d=1, s=1, p=0):
     
     # Row & column masks generation
     rows_active_str = '0b'
-    rows_active_arr = np.zeros(HOPTS['Y'], dtype=np.bool)
+    rows_active_arr = np.zeros(HOPTS['Y'], dtype=bool)
     cols_active_str = '0b'
-    cols_active_arr = np.zeros(HOPTS['X'], dtype=np.bool)
+    cols_active_arr = np.zeros(HOPTS['X'], dtype=bool)
     
     for j in range(HOPTS['Y']):
         if (j<Y_used):

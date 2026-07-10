@@ -134,7 +134,7 @@ def logarithm_multiplier(a, b, N_bits=16, m=0, approx='log', signed=True):
 # # Golden results are constant
 # golden_results = a*b
 
-# lm_results = np.zeros((N), dtype=np.int)
+# lm_results = np.zeros((N), dtype=int)
 
 # for i in range(N):
     
