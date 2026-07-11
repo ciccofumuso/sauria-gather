@@ -95,10 +95,7 @@ module sauria_interface #(
     reg stand_alone_keep_B;
     reg stand_alone_keep_C;
 
-    // control_regs[21][26]:
-    // Skip only the initial external-DRAM -> SRAM-A DMA preload.
-    // This flag must not force the core keep-A bit: the first core start
-    // must still switch to the host bank written by the gather.
+    // control_regs[21][26]: skip only the first DMA preload of SRAM A.
     reg skip_initial_A_dma;
 
     reg [REGS_CNT_BITS-1:0] wresp_count;
@@ -118,15 +115,6 @@ module sauria_interface #(
     reg Ch_eq;
     reg Ck_eq;
     reg WXfer_op;
-
-
-`ifndef SYNTHESIS
-    State_t dbg_state_q;
-    logic [31:0] dbg_state_cycles;
-    logic dbg_sauria_intr_q;
-    logic dbg_dma_reader_intr_q;
-    logic dbg_dma_writer_intr_q;
-`endif
 
     assign sauria_axilite.arvalid = 1'b0;
     assign sauria_axilite.araddr = 32'd0;
@@ -197,14 +185,11 @@ module sauria_interface #(
                 sauria_axilite.wdata[1] = 1'b1;
                 sauria_axilite.wdata[7] = 1'b0;
                 sauria_axilite.wdata[16] = 1'b1; //buffer swap
-
-                // In normal DMA mode keep_A comes exclusively from the DMA
-                // controller. When the initial A DMA is skipped, keep_A must
-                // remain 0 at the first core start so that the SRAM-A double
-                // buffer switches to the bank populated by the gather.
+                // If the initial A DMA was skipped, force the core-side
+                // keep-A bit so the gather-produced fmap is consumed.
                 sauria_axilite.wdata[17] = stand_alone
                                             ? stand_alone_keep_A
-                                            : keep_A;
+                                            : (skip_initial_A_dma ? 1'b1 : keep_A);
                 sauria_axilite.wdata[18] = stand_alone ? stand_alone_keep_B : keep_B;
                 sauria_axilite.wdata[19] = stand_alone ? stand_alone_keep_C : (!start ? 1'b0 : keep_C);
                 sauria_axilite.wdata[24] = 1'b0;
@@ -323,11 +308,8 @@ module sauria_interface #(
                 Cw_eq                                   <= control_regs[21][23];
                 Ch_eq                                   <= control_regs[21][24];
                 Ck_eq                                   <= control_regs[21][25];
-
-                // Bit 26 is independent from the standalone keep-A flag.
-                // It only skips the first DMA preload of SRAM A.
+                // Bit 26 is unused in the original map.
                 skip_initial_A_dma                      <= control_regs[21][26];
-
                 start_wresp_sync                        <= 1'b1;
                 start_dma_controller                    <= !control_regs[21][18];
 
@@ -476,74 +458,5 @@ module sauria_interface #(
             state <= IDLE;
         end
     end
-
-
-`ifndef SYNTHESIS
-    // Simulation-only trace. It does not alter the functional FSM.
-    always_ff @(posedge clk) begin
-        if (rst) begin
-            dbg_state_q             <= IDLE;
-            dbg_state_cycles        <= 32'd0;
-            dbg_sauria_intr_q       <= 1'b0;
-            dbg_dma_reader_intr_q   <= 1'b0;
-            dbg_dma_writer_intr_q   <= 1'b0;
-        end else begin
-            if (state != dbg_state_q) begin
-                $display("[%0t] [SAURIA_IF] state %0d -> %0d start=%0b fsm_start=%0b fsm_done=%0b dma_sync=%0b sauria_sync=%0b",
-                         $time, dbg_state_q, state, start, fsm_start, fsm_done,
-                         dma_sync, sauria_sync);
-                dbg_state_q      <= state;
-                dbg_state_cycles <= 32'd0;
-            end else if (state != IDLE) begin
-                dbg_state_cycles <= dbg_state_cycles + 32'd1;
-                if ((dbg_state_cycles != 0) && ((dbg_state_cycles % 32'd100000) == 0)) begin
-                    $display("[%0t] [SAURIA_IF][STALL] state=%0d cycles=%0d start=%0b skipA=%0b keepABC=%0b%0b%0b sauria_intr=%0b dma_r_intr=%0b dma_w_intr=%0b bvalid=%0b aw=%0b/%0b w=%0b/%0b",
-                             $time, state, dbg_state_cycles, start,
-                             skip_initial_A_dma, keep_A, keep_B, keep_C,
-                             sauria_interrupt_in, dma_reader_interrupt_in,
-                             dma_writer_interrupt_in, sauria_axilite.bvalid,
-                             sauria_axilite.awvalid, sauria_axilite.awready,
-                             sauria_axilite.wvalid, sauria_axilite.wready);
-                end
-            end else begin
-                dbg_state_cycles <= 32'd0;
-            end
-
-            if (fsm_start) begin
-                $display("[%0t] [SAURIA_IF] FSM_START flags=0x%08h standalone=%0b keepABC_cfg=%0b%0b%0b skip_initial_A=%0b",
-                         $time, control_regs[21], control_regs[21][18],
-                         control_regs[21][19], control_regs[21][20],
-                         control_regs[21][21], control_regs[21][26]);
-            end
-
-            if (start_dma_controller) begin
-                $display("[%0t] [SAURIA_IF] DMA_CONTROLLER_START skip_initial_A=%0b",
-                         $time, skip_initial_A_dma);
-            end
-
-            if ((state == SEND_START_DATA) && sauria_axilite.wvalid && sauria_axilite.wready) begin
-                $display("[%0t] [SAURIA_IF] CORE_CONTROL_WRITE data=0x%08h start=%0b switch=%0b keepABC=%0b%0b%0b",
-                         $time, sauria_axilite.wdata,
-                         sauria_axilite.wdata[0], sauria_axilite.wdata[16],
-                         sauria_axilite.wdata[17], sauria_axilite.wdata[18],
-                         sauria_axilite.wdata[19]);
-            end
-
-            if (!dbg_sauria_intr_q && sauria_interrupt_in)
-                $display("[%0t] [SAURIA_IF] SAURIA_INTERRUPT_RISE state=%0d", $time, state);
-            if (!dbg_dma_reader_intr_q && dma_reader_interrupt_in)
-                $display("[%0t] [SAURIA_IF] DMA_READER_INTERRUPT_RISE state=%0d", $time, state);
-            if (!dbg_dma_writer_intr_q && dma_writer_interrupt_in)
-                $display("[%0t] [SAURIA_IF] DMA_WRITER_INTERRUPT_RISE state=%0d", $time, state);
-
-            if (fsm_done)
-                $display("[%0t] [SAURIA_IF] FSM_DONE", $time);
-
-            dbg_sauria_intr_q     <= sauria_interrupt_in;
-            dbg_dma_reader_intr_q <= dma_reader_interrupt_in;
-            dbg_dma_writer_intr_q <= dma_writer_interrupt_in;
-        end
-    end
-`endif
 
 endmodule

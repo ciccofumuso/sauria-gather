@@ -1,0 +1,39 @@
+{
+  "mode": "gather_then_single_sauria_skip_initial_A",
+  "input_dir": "/home/henry/sauria/test/stimuli_vanilla_for_gather_sram",
+  "output_dir": "/home/henry/sauria/test/stimuli",
+  "n_values": 128,
+  "n_dense_cols": 128,
+  "ifmap_dram_base": "0x00000000",
+  "dense_stage_base": "0x00090000",
+  "comp_base": "0x00091000",
+  "idx_base": "0x00092000",
+  "gather_output": "0x00040000",
+  "poison_original_a": true,
+  "flags_old": "0x83800000",
+  "flags_new": "0x87800000",
+  "standalone": false,
+  "standalone_keep_A": false,
+  "skip_initial_A": true,
+  "metadata": {
+    "comp_beats": 2,
+    "idx_natural_beats": 64,
+    "idx_beats": 65
+  },
+  "controller_starts": [
+    61
+  ],
+  "debug_words": {
+    "0x50040000": "0xBE071E80",
+    "0x50040004": "0x373FB8FF",
+    "0x50040008": "0x418E3A7D",
+    "0x5004000C": "0xB1BD3A1C"
+  },
+  "expected_bank_sequence": [
+    "reset: select_A=0, host/gather accesses physical A bank 0",
+    "gather writes physical A bank 0",
+    "initial A DMA is skipped; B and C DMA still run",
+    "first core start uses keep_A=0 and toggles select_A to 1",
+    "core therefore reads physical A bank 0 written by gather"
+  ]
+}

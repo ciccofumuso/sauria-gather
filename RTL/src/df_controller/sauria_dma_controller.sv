@@ -38,6 +38,9 @@ module sauria_dma_controller (
     output keep_B,
     output keep_C,
     input start,
+    // Preserve the gather-produced SRAM A and begin the normal DMA
+    // sequence from SRAM B.
+    input skip_initial_A,
     output last_iter,
     AXI4Lite.master dma_axilite
 );
@@ -68,7 +71,8 @@ module sauria_dma_controller (
         WRESP_SYNC,
         SAURIA_SYNC,
         CHECK_NEXT_ACTION,
-        COPY_OPT
+        COPY_OPT,
+        PREPARE_B
     } State_t;
 
     typedef enum bit [1:0] {
@@ -87,6 +91,15 @@ module sauria_dma_controller (
     State_t state;
     SubState_t sub_state;
     NextAction_t next_action;
+
+
+`ifndef SYNTHESIS
+    State_t dbg_state_q;
+    SubState_t dbg_sub_state_q;
+    logic [31:0] dbg_state_cycles;
+    logic dbg_reader_intr_q;
+    logic dbg_writer_intr_q;
+`endif
 
     //Vivado synthesis detects this as an FSM and changes the encoding
     (* DONT_TOUCH = "true" *) reg [5:0] addr;
@@ -266,7 +279,16 @@ module sauria_dma_controller (
                 zcounter <= '0;
                 y <= '0;
                 z <= '0;
-                set_A_params();
+                // Normal flow starts from A. When A has already been
+                // produced by the gather, skip only the initial A DMA and
+                // continue with B -> C -> compute -> C writeback.
+                if (skip_initial_A) begin
+                    set_B_params();
+                    sub_state <= DMA_BRING_B;
+                end else begin
+                    set_A_params();
+                    sub_state <= DMA_BRING_A;
+                end
                 addr <= INTERRUPT_MASK_REGISTER_OFFSET;
                 wdata[0] <= 1'b1; //writer interrupt enable
                 wdata[1] <= 1'b1; //reader interrupt enable
@@ -276,12 +298,27 @@ module sauria_dma_controller (
                 last_iter_2 <= 1'b0;
                 first_tile <= 1'b1;
                 first_dma_iter <= 1'b1;
-                sub_state <= DMA_BRING_A;
                 goto_sync_sauria <= 1'b0;
                 if (start) begin
                     start_wresp_sync <= 1'b1;
-                    state <= SEND_CMD;
+
+                    // skip_initial_A becomes valid together with the controller
+                    // start pulse. set_B_params() uses non-blocking assignments,
+                    // therefore entering SEND_CMD immediately would expose the
+                    // previous ett value and program BTT=0. Use one preparation
+                    // cycle before emitting the first B DMA command.
+                    if (skip_initial_A) begin
+                        state <= PREPARE_B;
+                    end else begin
+                        state <= SEND_CMD;
+                    end
                 end
+            end
+
+            PREPARE_B: begin
+                set_B_params();
+                sub_state <= DMA_BRING_B;
+                state <= SEND_CMD;
             end
 
             SEND_CMD: begin
@@ -604,5 +641,70 @@ module sauria_dma_controller (
             state <= IDLE;
         end
     end
+
+
+`ifndef SYNTHESIS
+    // Simulation-only trace. State numbers follow State_t/SubState_t above.
+    always_ff @(posedge clk) begin
+        if (rst) begin
+            dbg_state_q       <= IDLE;
+            dbg_sub_state_q   <= DMA_BRING_A;
+            dbg_state_cycles  <= 32'd0;
+            dbg_reader_intr_q <= 1'b0;
+            dbg_writer_intr_q <= 1'b0;
+        end else begin
+            if ((state != dbg_state_q) || (sub_state != dbg_sub_state_q)) begin
+                $display("[%0t] [SAURIA_DMA] state %0d/%0d -> %0d/%0d skipA=%0b btt=%0d ett=%0d y=%0d/%0d z=%0d/%0d local=0x%08h next=%0d goto_core=%0b",
+                         $time, dbg_state_q, dbg_sub_state_q, state, sub_state,
+                         skip_initial_A, btt, ett, y, ylim, z, zlim,
+                         local_SRAM_addr, next_action, goto_sync_sauria);
+                dbg_state_q      <= state;
+                dbg_sub_state_q  <= sub_state;
+                dbg_state_cycles <= 32'd0;
+            end else if (state != IDLE) begin
+                dbg_state_cycles <= dbg_state_cycles + 32'd1;
+                if ((dbg_state_cycles != 0) && ((dbg_state_cycles % 32'd100000) == 0)) begin
+                    $display("[%0t] [SAURIA_DMA][STALL] state=%0d sub=%0d cycles=%0d skipA=%0b btt=%0d intrR/W=%0b/%0b aw=%0b/%0b w=%0b/%0b b=%0b/%0b addr=0x%02h wdata=0x%08h",
+                             $time, state, sub_state, dbg_state_cycles,
+                             skip_initial_A, btt,
+                             dma_reader_interrupt, dma_writer_interrupt,
+                             dma_axilite.awvalid, dma_axilite.awready,
+                             dma_axilite.wvalid, dma_axilite.wready,
+                             dma_axilite.bvalid, dma_axilite.bready,
+                             addr, wdata);
+                end
+            end else begin
+                dbg_state_cycles <= 32'd0;
+            end
+
+            if (start)
+                $display("[%0t] [SAURIA_DMA] START skip_initial_A=%0b selected_sub=%0d btt=%0d",
+                         $time, skip_initial_A, sub_state, btt);
+
+            if (dma_axilite.awvalid && dma_axilite.awready)
+                $display("[%0t] [SAURIA_DMA][AXIL] AW addr=0x%02h state=%0d sub=%0d",
+                         $time, dma_axilite.awaddr, state, sub_state);
+            if (dma_axilite.wvalid && dma_axilite.wready)
+                $display("[%0t] [SAURIA_DMA][AXIL] W data=0x%08h state=%0d sub=%0d",
+                         $time, dma_axilite.wdata, state, sub_state);
+            if (dma_axilite.bvalid && dma_axilite.bready)
+                $display("[%0t] [SAURIA_DMA][AXIL] B state=%0d sub=%0d",
+                         $time, state, sub_state);
+
+            if (!dbg_reader_intr_q && dma_reader_interrupt)
+                $display("[%0t] [SAURIA_DMA] READER_INTERRUPT_RISE state=%0d sub=%0d",
+                         $time, state, sub_state);
+            if (!dbg_writer_intr_q && dma_writer_interrupt)
+                $display("[%0t] [SAURIA_DMA] WRITER_INTERRUPT_RISE state=%0d sub=%0d",
+                         $time, state, sub_state);
+            if (sauria_sync && dma_sync)
+                $display("[%0t] [SAURIA_DMA] SAURIA_SYNC_HANDSHAKE next=%0d last_iter=%0b",
+                         $time, next_action, last_iter);
+
+            dbg_reader_intr_q <= dma_reader_interrupt;
+            dbg_writer_intr_q <= dma_writer_interrupt;
+        end
+    end
+`endif
 
 endmodule

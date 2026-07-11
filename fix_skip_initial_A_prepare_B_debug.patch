@@ -1,0 +1,48 @@
+--- a/RTL/src/df_controller/sauria_dma_controller.sv
++++ b/RTL/src/df_controller/sauria_dma_controller.sv
+@@ -70,7 +70,8 @@
+         WRESP_SYNC,
+         SAURIA_SYNC,
+         CHECK_NEXT_ACTION,
+-        COPY_OPT
++        COPY_OPT,
++        PREPARE_B
+     } State_t;
+ 
+     typedef enum bit [1:0] {
+@@ -296,8 +297,24 @@
+                 goto_sync_sauria <= 1'b0;
+                 if (start) begin
+                     start_wresp_sync <= 1'b1;
+-                    state <= SEND_CMD;
+-                end
++
++                    // skip_initial_A becomes valid together with the controller
++                    // start pulse. set_B_params() uses non-blocking assignments,
++                    // therefore entering SEND_CMD immediately would expose the
++                    // previous ett value and program BTT=0. Use one preparation
++                    // cycle before emitting the first B DMA command.
++                    if (skip_initial_A) begin
++                        state <= PREPARE_B;
++                    end else begin
++                        state <= SEND_CMD;
++                    end
++                end
++            end
++
++            PREPARE_B: begin
++                set_B_params();
++                sub_state <= DMA_BRING_B;
++                state <= SEND_CMD;
+             end
+ 
+             SEND_CMD: begin
+@@ -676,7 +693,7 @@
+             if (!dbg_writer_intr_q && dma_writer_interrupt)
+                 $display("[%0t] [SAURIA_DMA] WRITER_INTERRUPT_RISE state=%0d sub=%0d",
+                          $time, state, sub_state);
+-            if (sauria_sync)
++            if (sauria_sync && dma_sync)
+                 $display("[%0t] [SAURIA_DMA] SAURIA_SYNC_HANDSHAKE next=%0d last_iter=%0b",
+                          $time, next_action, last_iter);
+ 
