@@ -1,0 +1,171 @@
+{
+  "mode": "gather_then_single_sauria_skip_initial_A",
+  "sparse_format": "CSR",
+  "active_columns": [
+    0,
+    2,
+    3,
+    4,
+    5,
+    7,
+    9,
+    10,
+    11,
+    13,
+    14
+  ],
+  "physical_A_shape": [
+    8,
+    16
+  ],
+  "compact_A_shape": [
+    11,
+    8
+  ],
+  "gather_output_flat_shape": [
+    88
+  ],
+  "elements_per_block": 16,
+  "block_nnz": [
+    8,
+    16,
+    16,
+    8,
+    8,
+    16,
+    8,
+    8
+  ],
+  "block_local_indices": [
+    [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7
+    ],
+    [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11,
+      12,
+      13,
+      14,
+      15
+    ],
+    [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11,
+      12,
+      13,
+      14,
+      15
+    ],
+    [
+      8,
+      9,
+      10,
+      11,
+      12,
+      13,
+      14,
+      15
+    ],
+    [
+      8,
+      9,
+      10,
+      11,
+      12,
+      13,
+      14,
+      15
+    ],
+    [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11,
+      12,
+      13,
+      14,
+      15
+    ],
+    [
+      8,
+      9,
+      10,
+      11,
+      12,
+      13,
+      14,
+      15
+    ],
+    [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7
+    ]
+  ],
+  "pointer_entries": 10,
+  "index_entries": 88,
+  "index_natural_beats_from_layout": 44,
+  "is_spmm": 1,
+  "dense_base": "0x00002000",
+  "comp_base": "0x00003000",
+  "idx_base": "0x00004000",
+  "dense_beats": 32,
+  "comp_beats": 5,
+  "idx_natural_beats": 44,
+  "idx_padding_beats": 1,
+  "idx_total_beats": 45,
+  "flags_old": "0x83800000",
+  "flags_new": "0x87800000",
+  "skip_initial_A": true,
+  "standalone_keep_A": false,
+  "controller_starts": [
+    61
+  ],
+  "poison_compact_A": true,
+  "debug_expected": {
+    "0x50040000": "0x2BB3B258",
+    "0x50040004": "0x3595B796",
+    "0x50040008": "0xACAC311B",
+    "0x5004000C": "0x2CDDACFE"
+  }
+}

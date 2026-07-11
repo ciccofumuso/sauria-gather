@@ -81,6 +81,14 @@ typedef enum logic [2:0] {
 
 state_e current_state, next_state;
 
+logic r_fire;
+
+// AXI R-channel transfer occurs only on VALID && READY.
+// Keep READY outside the FSM combinational block so every condition observes
+// the current FIFO backpressure value, never the previous delta-cycle value.
+assign r_ready = (current_state == READ_BURST) && !fifo_full;
+assign r_fire  = r_valid && r_ready;
+
 
 always_ff @(posedge clk_i  or negedge rst_ni) begin
 	if (!rst_ni) begin
@@ -104,8 +112,6 @@ always_comb begin
 			reg_data_en		= 1'b0;
 			reg_data_rst_n	= 1'b0;
 			ar_burst	 	= 2'b01;  // INCR
-			r_ready  		= 1'b0;
-			
 			if (start) begin
 				next_state = START;
 			end else begin
@@ -124,8 +130,6 @@ always_comb begin
 			reg_data_en		= 1'b0;
 			reg_data_rst_n	= 1'b0;
 			ar_burst	 	= 2'b01;
-			r_ready  		= 1'b0;
-			
 		end
 		
 		READ_REQ: begin
@@ -144,12 +148,13 @@ always_comb begin
 			reg_data_en		= 1'b0;
 			reg_data_rst_n	= 1'b0;
 			ar_burst	 	= 2'b01;  
-			r_ready  		= 1'b0;
 		end
 
 		READ_BURST: begin
-			if (r_valid && r_last && r_ready) begin
-				// Se è l'ultimo dato del burst
+			// RLAST is consumed only together with the final R-channel handshake.
+			// If the FIFO applies backpressure, the FSM remains here until the
+			// slave presents the same RVALID/RLAST beat with RREADY high.
+			if (r_fire && r_last) begin
 				next_state = DONE;
 			end else begin
 				next_state = READ_BURST;
@@ -159,15 +164,10 @@ always_comb begin
 			ar_valid 		= 1'b0;
 			ar_size_en  	= 1'b0;
 			ar_size_rst_n	= 1'b1;
-			reg_data_en		= 1'b1; // Abilito il registro dei dati
+			reg_data_en		= r_fire;
 			reg_data_rst_n	= 1'b1;
-			ar_burst	 	= 2'b01;  
-			r_ready 		= !fifo_full; 
-			if (r_valid && r_ready) begin
-				valid_data	 	= 1'b1;	// Il dato è valido per il Campionamento
-			end else begin
-				valid_data	 	= 1'b0;	// Il dato non è pronto
-			end
+			ar_burst	 	= 2'b01;
+			valid_data	 	= r_fire;
 		end
 		
 		DONE: begin
@@ -181,7 +181,6 @@ always_comb begin
 			reg_data_en		= 1'b0; // Disabilito il registro dei dati
 			reg_data_rst_n	= 1'b1;
 			ar_burst	 	= 2'b01;  
-			r_ready 		= 1'b0; 
 		end
 
 		default: begin
@@ -195,7 +194,6 @@ always_comb begin
 			reg_data_en		= 1'b0;
 			reg_data_rst_n	= 1'b0;
 			ar_burst	 	= 2'b01;
-			r_ready  		= 1'b0;
 		end
 	endcase
 end
@@ -266,7 +264,9 @@ end
 assign end_burst = (sub_len_out == '0);
 
 
-assign add_addr_out = reg_addr_out + (32'(ar_len_out+8'd1) << ar_size_out);
+// Widen ARLEN before adding one: 8'hFF + 1 must become 256, not wrap to 0.
+assign add_addr_out = reg_addr_out +
+                      ((32'(ar_len_out) + 32'd1) << ar_size_out);
 
 always_ff @(posedge clk_i  or negedge rst_n_multi_burst) begin
 	if (!rst_n_multi_burst) begin

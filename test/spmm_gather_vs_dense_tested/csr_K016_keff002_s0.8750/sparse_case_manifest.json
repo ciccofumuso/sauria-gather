@@ -1,0 +1,15 @@
+{
+  "M": 16,
+  "K": 16,
+  "N": 8,
+  "k_eff": 2,
+  "sparsity": 0.875,
+  "nnz": 32,
+  "selected_format": "CSR",
+  "active_columns": [
+    2,
+    5
+  ],
+  "csr_bytes": 260,
+  "csc_bytes": 260
+}
