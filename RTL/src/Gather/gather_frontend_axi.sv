@@ -10,14 +10,14 @@ module gather_frontend_axi #(
 
     parameter int FIFO_DEPTH       = 16,
     parameter int FIFO_THRESHOLD   = 14,
-    parameter int unsigned NumWords_idx  = 128,
+    parameter int unsigned NumWords_idx  = 64,
     parameter int unsigned ByteWidth_idx = 32,
     parameter int unsigned NumWords      = 128,
     parameter int unsigned ByteWidth     = 16,
     parameter int unsigned NumPorts      = 1,
     parameter int unsigned Latency       = 1,
     parameter int N_BLOCKS               = 16,
-    parameter int BUFFER_BIT_ADDR        = 4
+    parameter int BUFFER_BIT_ADDR        = 3
 )(
     input  logic i_clk,
     input  logic i_rstn,
