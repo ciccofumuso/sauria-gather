@@ -1,0 +1,8 @@
+{
+  "mode": "dense_sauria",
+  "flags_old": "0x83800000",
+  "flags_new": "0x83800000",
+  "controller_starts": [
+    43
+  ]
+}

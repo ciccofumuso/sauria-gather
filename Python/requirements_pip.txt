@@ -43,3 +43,11 @@ urllib3==2.1.0
 wheel==0.42.0
 dotenv
 ipykernel
+numpy
+pandas
+matplotlib
+torch
+python-dotenv
+ipython
+ipykernel
+jupyterlab
