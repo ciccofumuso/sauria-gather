@@ -83,9 +83,7 @@ state_e current_state, next_state;
 
 logic r_fire;
 
-// AXI R-channel transfer occurs only on VALID && READY.
-// Keep READY outside the FSM combinational block so every condition observes
-// the current FIFO backpressure value, never the previous delta-cycle value.
+
 assign r_ready = (current_state == READ_BURST) && !fifo_full;
 assign r_fire  = r_valid && r_ready;
 
@@ -151,9 +149,6 @@ always_comb begin
 		end
 
 		READ_BURST: begin
-			// RLAST is consumed only together with the final R-channel handshake.
-			// If the FIFO applies backpressure, the FSM remains here until the
-			// slave presents the same RVALID/RLAST beat with RREADY high.
 			if (r_fire && r_last) begin
 				next_state = DONE;
 			end else begin
@@ -264,9 +259,8 @@ end
 assign end_burst = (sub_len_out == '0);
 
 
-// Widen ARLEN before adding one: 8'hFF + 1 must become 256, not wrap to 0.
-assign add_addr_out = reg_addr_out +
-                      ((32'(ar_len_out) + 32'd1) << ar_size_out);
+
+assign add_addr_out = reg_addr_out + ((32'(ar_len_out) + 32'd1) << ar_size_out);
 
 always_ff @(posedge clk_i  or negedge rst_n_multi_burst) begin
 	if (!rst_n_multi_burst) begin
