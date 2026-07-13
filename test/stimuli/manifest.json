@@ -507,13 +507,13 @@
   "index_natural_beats_from_layout": 204,
   "is_spmm": 1,
   "dense_base": "0x00002000",
-  "comp_base": "0x00003000",
-  "idx_base": "0x00004000",
-  "dense_beats": 512,
+  "comp_base": "0x00004000",
+  "idx_base": "0x00005000",
+  "dense_beats": 1024,
   "comp_beats": 5,
   "idx_natural_beats": 204,
-  "idx_padding_beats": 1,
-  "idx_total_beats": 205,
+  "idx_padding_beats": 0,
+  "idx_total_beats": 204,
   "flags_old": "0x83800000",
   "flags_new": "0x87800000",
   "skip_initial_A": true,
@@ -523,9 +523,9 @@
   ],
   "poison_compact_A": true,
   "debug_expected": {
-    "0x50040000": "0x8643CC3F",
-    "0x50040004": "0x2351D9E7",
-    "0x50040008": "0x94EF1CF3",
-    "0x5004000C": "0xDE599FDF"
+    "0x50040000": "0xAB3BAC48",
+    "0x50040004": "0x301E31C3",
+    "0x50040008": "0xA578A41B",
+    "0x5004000C": "0xB0EA2926"
   }
 }
