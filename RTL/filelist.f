@@ -188,5 +188,6 @@ ${RTL_DIR}/src/Gather/accel_dp.sv
 ${RTL_DIR}/src/Gather/accel_top.sv
 ${RTL_DIR}/src/Gather/gather_frontend_axi.sv
 ${RTL_DIR}/src/Gather/axi_busy_priority_mux.sv
+${RTL_DIR}/src/sauria_phase_monitor.sv
 
 ${RTL_DIR}/src/sauria_subsystem.sv

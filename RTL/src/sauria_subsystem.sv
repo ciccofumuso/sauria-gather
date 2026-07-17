@@ -745,4 +745,22 @@ always_ff @(posedge i_system_clk) begin
 end
 `endif
 
+`ifndef SYNTHESIS
+	sauria_phase_monitor #(
+		.ADDR_W (DATA_AXI_ADDR_WIDTH)
+	) sauria_phase_monitor_i (
+		.clk_i               (i_system_clk),
+		.rst_ni              (i_system_rstn),
+
+		.gather_busy_i       (gather_busy),
+		.gather_done_i       (gather_doneintr),
+		.sauria_done_i       (sauria_intr2control),
+
+		.dma_aw_addr_i       (dma_mem_sauria.aw_addr),
+		.dma_aw_valid_i      (dma_mem_sauria.aw_valid),
+		.dma_aw_ready_i      (dma_mem_sauria.aw_ready),
+		.dma_writer_done_i   (dma_wr_intr2control)
+	);
+`endif
+
 endmodule 
