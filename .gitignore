@@ -18,5 +18,6 @@ work.lib++
 verdi_config_file
 *.txt
 *.npy
-test/spmm_gather_vs_dense_int8_8x16_axi64
-test/spmm_gather_vs_dense_tested/*
+test/spmm_gather_vs_dense_int8
+test/spmm_gather_vs_dense_fp16_random_sparsity
+test/spmm_gather_vs_dense_fp16
