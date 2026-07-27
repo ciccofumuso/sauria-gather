@@ -1,0 +1,3588 @@
+diff --git a/RTL/src/Gather/accel_cu.sv b/RTL/src/Gather/accel_cu.sv
+index 4fcfa49..eb4753b 100644
+--- a/RTL/src/Gather/accel_cu.sv
++++ b/RTL/src/Gather/accel_cu.sv
+@@ -1,997 +1,400 @@
+-`timescale 1ns/1ps
+-module accel_cu(
+-	input  	logic 		clk,rst_n,start,
+-	output	logic		done,
+-	// INTERFACCIA AXI4 READ
+-	output  logic 		axi_rd_rst_n, 
+-	output  logic       axi_rd_start,  		// Richiesta di lettura valida 
+-    input 	logic       axi_rd_available,  	// Disponibile ad accettare una nuova richiesta
+-	input 	logic       axi_rd_done,		// Ultimo dato arrivato
+-	output	logic		axi_rd_done_rst_n, 
+-
+-	// INTERFACCIA FIFO		
+-	output  logic       fifo_r_en, 
+-	output	logic       fifo_rst_n,    
+-    input 	logic       fifo_empty,    
+-			
+-	// INTERFACCIA MEMORIA		
+-	output	logic       mem_rst_n, 
+-	output	logic 		mem_wr_en, 
+-	output	logic 		mem_idx_wr_en, 
+-	output	logic 		mem_idx_mem_en, 
+-			
+-	// INTERFACCIA BUFFER 		
+-	output	logic       buffer_rst_n, 
+-	output  logic       buffer_data_in_valid, 
+-    output  logic       buffer_data_in_last, 
+-	input 	logic       buffer_wait_wr,
+-	input	logic		buffer_data_out_valid,
+-			
+-	// INTERFACCIA AXI4 WRITE		
+-	output  logic 		axi_wr_rst_n,      
+-	input 	logic       axi_wr_done,		
+-	output	logic		axi_wr_done_rst_n, 
+-	output	logic		rst_n_multi_burst,
+-	
+-	// INTERFACCIA ADDRESS MANAGER
+-	// Segnali di stato delle impostazioni del driver
+-	input 	logic 		tc_wr_mem,   // Fine scrittura della memoria densa
+-	input 	logic 		wr_index,	 // Scritura memoria degli indici compressi
+-	input 	logic 		tc_rd_index, // Lettura degli indici
+-	// Gestione indirizzi per la memoria a blocchi
+-	output 	logic		cnt_row_en,cnt_row_rst_n, 
+-	output  logic		rd_b_mem, 
+-	// Segnali PISO
+-	output	logic		piso_rst_n,piso_load,piso_shift_en, 
+-	input	logic		piso_empty,
+-	output	logic		comp_idx_ptr_old_en,comp_idx_ptr_old_rst_n, 
+-	output	logic		mux_comp_idx_sel, 
+-	output 	logic		cnt_nnzs_en,cnt_nnzs_rst_n, 
+-	input 	logic 		last_index, end_rd_index,
+-	input	logic		tc_nnzs,
+-	// Gestione blocco di SRAM per spMM
+-	output 	logic		cnt_stage_en,cnt_stage_rst_n,	// Si incrementa quando tc_nnzs = 1
+-	// Indicizzazione memoria degli indici
+-	output 	logic		cnt_comp_idx_en,cnt_comp_idx_rst_n
+-);
+-
+-typedef enum logic [5:0] {
+-	IDLE,       			// Attesa comando
+-	START,      			// Campionamento parametri
+-	WAIT_AXI_RD,			// Attesa memoria per leggere i dati da salvare internamente
+-	RD_FIFO_WR_MEM,			// Prelevamento dati dalla FIFO per scrivere in memoria
+-	WR_B,					// Scrittura in entrambe le memorie
+-	WR_LAST_DATA,			// Svuotamento FIFO per evitare di scrivere in locazioni sbagliate
+-	START_NEXT_AXI_ADDR,	// Invio richiesta per ricevere altri dati dalla memoria esterna
+-	REQ_MEM_1_PTR,			// Invio l'indirizzo per il 1° indice compresso
+-	RD_1_PTR,				// Lettura 1° indice compresso
+-	RD_2_PTR,				// Lettura 2° indice compresso
+-	REQ_MEM_NEW_PTR,		// Richiesta nuovo indice compresso
+-	START_OP,				// Check iniziale condizioni riga
+-	RD_FIFO,				// Estrazione parallela word indici colonna da FIFO
+-	LOAD_PISO,				// Caricamento parallelo nel SIPO/PISO
+-	REQ_MEM_DATA,			// Fase di inserimento indirizzo (PISO bloccata, segnali stabili)
+-	WR_BUFFER,				// Fase di lettura sincrona e validazione dato (PISO avanza)
+-	CLR_AXI_RD_DONE,		// Reset del flag done precedente
+-	AXI_RD_NEXT_ADDR,		// Invio del nuovo comando di avvio burst su canale AXI
+-	UPDATE_BLOCK,			// Aggiornamento del blocco di memoria selezionato
+-	FLUSH_BUFFER,			// Svuotamento buffer quando ho finito le operazioni di ricerca valori
+-	WAIT_AXI_WR,			// Attesa fine invio dati all'ALU
+-	DONE					// Fine operazioni
+-} state_e;
+-
+-state_e current_state, next_state;
+-
+-logic fifo_data_vld_q;
+-logic nnzs_check;
+-
+-// Ritardo di 1 colpo di clock del segnale di lettura della FIFO per la fase di scrittura iniziale
+-always_ff @(posedge clk or negedge rst_n) begin
+-    if (!rst_n) begin
+-        fifo_data_vld_q <= 1'b0;
+-	end else begin
+-        fifo_data_vld_q <= fifo_r_en;
+-	end
+-end
+-
+-// Logica Sequenziale FSM
+-always_ff @(posedge clk or negedge rst_n) begin
+-	if (!rst_n) begin
+-		current_state <= IDLE;
+-	end else begin        
+-		current_state <= next_state;
+-	end
+-end
+-
+-// Registro di protezione per evitare falsi positivi di last_index su righe vuote iniziali
+-always_ff @(posedge clk or negedge rst_n) begin
+-	if (!rst_n) begin
+-		nnzs_check <= 1'b0;
+-	end else begin
+-		if (current_state == IDLE || current_state == START) begin
+-			nnzs_check <= 1'b0;
+-		end else if ((current_state == RD_2_PTR || current_state == REQ_MEM_NEW_PTR) && !last_index) begin
+-			nnzs_check <= 1'b1;
+-		end
+-	end
+-end
+-
+-// Definizione Stati e Logica Combinatoria delle Uscite
+-always_comb begin
+-	case(current_state)
+-	
+-		IDLE : begin
+-			if (start) next_state = START;
+-			else next_state = IDLE;
+-			axi_rd_rst_n			= 1'b0; 
+-			axi_rd_start			= 1'b0; 
+-			axi_rd_done_rst_n		= 1'b0;
+-			fifo_r_en				= 1'b0; 
+-			fifo_rst_n				= 1'b0; 
+-			mem_rst_n				= 1'b0;
+-			mem_wr_en				= 1'b0; 
+-			mem_idx_wr_en			= 1'b0; 
+-			mem_idx_mem_en			= 1'b0;
+-			buffer_rst_n			= 1'b0; 
+-			buffer_data_in_valid	= 1'b0; 
+-			buffer_data_in_last     = 1'b0;
+-			axi_wr_rst_n            = 1'b0; 
+-			axi_wr_done_rst_n       = 1'b0; 
+-			rst_n_multi_burst		= 1'b0;
+-			cnt_row_en              = 1'b0; 
+-			cnt_row_rst_n           = 1'b0; 
+-			rd_b_mem           		= 1'b0;
+-			piso_rst_n              = 1'b0; 
+-			piso_load               = 1'b0; 
+-			piso_shift_en           = 1'b0;
+-			comp_idx_ptr_old_en     = 1'b0; 
+-			mux_comp_idx_sel        = 1'b0; 
+-			cnt_nnzs_en             = 1'b0;
+-			cnt_nnzs_rst_n          = 1'b0; 
+-			comp_idx_ptr_old_rst_n  = 1'b0; 
+-			cnt_stage_en            = 1'b0;
+-			cnt_stage_rst_n         = 1'b0; 
+-			cnt_comp_idx_en         = 1'b0; 
+-			cnt_comp_idx_rst_n      = 1'b0;
+-			done					= 1'b0;
+-		end
+-		
+-		START : begin
+-			next_state = WAIT_AXI_RD;
+-			axi_rd_rst_n			= 1'b1; 
+-			axi_rd_start			= 1'b1; 
+-			axi_rd_done_rst_n		= 1'b1;
+-			fifo_r_en				= 1'b0; 
+-			fifo_rst_n				= 1'b1; 
+-			mem_rst_n				= 1'b1;
+-			mem_wr_en				= 1'b0; 
+-			mem_idx_wr_en			= 1'b0; 
+-			mem_idx_mem_en			= 1'b0;
+-			buffer_rst_n			= 1'b1; 
+-			buffer_data_in_valid	= 1'b0; 
+-			buffer_data_in_last     = 1'b0;
+-			axi_wr_rst_n            = 1'b1; 
+-			axi_wr_done_rst_n       = 1'b1; 
+-			rst_n_multi_burst		= 1'b1;
+-			cnt_row_en              = 1'b0; 
+-			cnt_row_rst_n           = 1'b1; 
+-			rd_b_mem           		= 1'b0;
+-			piso_rst_n              = 1'b1; 
+-			piso_load               = 1'b0; 
+-			piso_shift_en           = 1'b0;
+-			comp_idx_ptr_old_en     = 1'b0; 
+-			mux_comp_idx_sel        = 1'b0; 
+-			cnt_nnzs_en             = 1'b0;
+-			cnt_nnzs_rst_n          = 1'b1; 
+-			comp_idx_ptr_old_rst_n  = 1'b1; 
+-			cnt_stage_en            = 1'b0;
+-			cnt_stage_rst_n         = 1'b1; 
+-			cnt_comp_idx_en         = 1'b0; 
+-			cnt_comp_idx_rst_n      = 1'b1;
+-			done					= 1'b0;
+-		end
+-		
+-		WAIT_AXI_RD : begin
+-			if (fifo_empty) next_state = WAIT_AXI_RD;
+-			else next_state = RD_FIFO_WR_MEM;
+-			axi_rd_rst_n			= 1'b1; 
+-			axi_rd_start			= 1'b0; 
+-			axi_rd_done_rst_n		= 1'b1;
+-			fifo_r_en				= 1'b0; 
+-			fifo_rst_n				= 1'b1; 
+-			mem_rst_n				= 1'b1;
+-			mem_wr_en				= 1'b0; 
+-			mem_idx_wr_en			= 1'b0; 
+-			mem_idx_mem_en			= 1'b0;
+-			buffer_rst_n			= 1'b1; 
+-			buffer_data_in_valid	= 1'b0; 
+-			buffer_data_in_last     = 1'b0;
+-			axi_wr_rst_n            = 1'b1; 
+-			axi_wr_done_rst_n       = 1'b1; 
+-			rst_n_multi_burst		= 1'b1;
+-			cnt_row_en              = 1'b0; 
+-			cnt_row_rst_n           = 1'b1; 
+-			rd_b_mem           		= 1'b0;
+-			piso_rst_n              = 1'b1; 
+-			piso_load               = 1'b0; 
+-			piso_shift_en           = 1'b0;
+-			comp_idx_ptr_old_en     = 1'b0; 
+-			mux_comp_idx_sel        = 1'b0; 
+-			cnt_nnzs_en             = 1'b0;
+-			cnt_nnzs_rst_n          = 1'b1; 
+-			comp_idx_ptr_old_rst_n  = 1'b1; 
+-			cnt_stage_en            = 1'b0;
+-			cnt_stage_rst_n         = 1'b1; 
+-			cnt_comp_idx_en         = 1'b0; 
+-			cnt_comp_idx_rst_n      = 1'b1;
+-			done					= 1'b0;
+-		end
+-		
+-		RD_FIFO_WR_MEM : begin
+-			next_state = WR_B;
+-			axi_rd_rst_n			= 1'b1; 
+-			axi_rd_start			= 1'b0; 
+-			axi_rd_done_rst_n		= 1'b1;
+-			fifo_r_en				= 1'b1; 
+-			fifo_rst_n				= 1'b1; 
+-			mem_rst_n				= 1'b1;
+-			mem_wr_en				= 1'b0; 
+-			mem_idx_wr_en			= 1'b0; 
+-			mem_idx_mem_en			= 1'b0;
+-			buffer_rst_n			= 1'b1; 
+-			buffer_data_in_valid	= 1'b0; 
+-			buffer_data_in_last     = 1'b0;
+-			axi_wr_rst_n            = 1'b1; 
+-			axi_wr_done_rst_n       = 1'b1; 
+-			rst_n_multi_burst		= 1'b1;
+-			cnt_row_en              = 1'b0; 
+-			cnt_row_rst_n           = 1'b1; 
+-			rd_b_mem           		= 1'b0;
+-			piso_rst_n              = 1'b1; 
+-			piso_load               = 1'b0; 
+-			piso_shift_en           = 1'b0;
+-			comp_idx_ptr_old_en     = 1'b0; 
+-			mux_comp_idx_sel        = 1'b0; 
+-			cnt_nnzs_en             = 1'b0;
+-			cnt_nnzs_rst_n          = 1'b1; 
+-			comp_idx_ptr_old_rst_n  = 1'b1; 
+-			cnt_stage_en            = 1'b0;
+-			cnt_stage_rst_n         = 1'b1; 
+-			cnt_comp_idx_en         = 1'b0; 
+-			cnt_comp_idx_rst_n      = 1'b1;
+-			done					= 1'b0;
+-		end
+-		
+-		WR_B : begin
+-			if (axi_rd_done && axi_rd_available && fifo_empty && !fifo_data_vld_q) begin
+-				next_state = WR_LAST_DATA;
+-			end else begin
+-				next_state = WR_B;
+-			end
+-			fifo_r_en = !fifo_empty;
+-			if (wr_index) begin
+-				mem_wr_en				= 1'b0;
+-				cnt_row_en              = 1'b0;
+-				cnt_comp_idx_en         = fifo_data_vld_q;
+-				mem_idx_wr_en			= fifo_data_vld_q;
+-				mem_idx_mem_en			= fifo_data_vld_q;
+-			end else begin
+-				mem_wr_en				= fifo_data_vld_q;
+-				cnt_row_en              = fifo_data_vld_q;
+-				cnt_comp_idx_en         = 1'b0;
+-				mem_idx_wr_en			= 1'b0;
+-				mem_idx_mem_en			= 1'b0;
+-			end
+-			axi_rd_rst_n			= 1'b1; 
+-			axi_rd_start			= 1'b0; 
+-			axi_rd_done_rst_n		= 1'b1;
+-			fifo_rst_n				= 1'b1; 
+-			mem_rst_n				= 1'b1; 
+-			buffer_rst_n			= 1'b1;
+-			buffer_data_in_valid	= 1'b0; 
+-			buffer_data_in_last     = 1'b0; 
+-			axi_wr_rst_n            = 1'b1;
+-			axi_wr_done_rst_n       = 1'b1; 
+-			rst_n_multi_burst		= 1'b1; 
+-			cnt_row_rst_n           = 1'b1;
+-			rd_b_mem           		= 1'b0; 
+-			piso_rst_n              = 1'b1; 
+-			piso_load               = 1'b0;
+-			piso_shift_en           = 1'b0; 
+-			comp_idx_ptr_old_en     = 1'b0; 
+-			mux_comp_idx_sel        = 1'b0;
+-			cnt_nnzs_en             = 1'b0; 
+-			cnt_nnzs_rst_n          = 1'b1; 
+-			comp_idx_ptr_old_rst_n  = 1'b1;
+-			cnt_stage_en            = 1'b0; 
+-			cnt_stage_rst_n         = 1'b1; 
+-			cnt_comp_idx_rst_n      = 1'b1;
+-			done					= 1'b0;
+-		end
+-		
+-		WR_LAST_DATA : begin
+-			if (tc_wr_mem) next_state = REQ_MEM_1_PTR;
+-			else next_state = START_NEXT_AXI_ADDR;
+-			if (wr_index) begin
+-				mem_wr_en       = 1'b0; 
+-				cnt_row_en      = 1'b0;
+-				mem_idx_wr_en   = fifo_data_vld_q; 
+-				mem_idx_mem_en  = fifo_data_vld_q;
+-				cnt_comp_idx_en = fifo_data_vld_q;
+-			end else begin
+-				mem_wr_en       = fifo_data_vld_q; 
+-				cnt_row_en      = fifo_data_vld_q;
+-				mem_idx_wr_en   = 1'b0; 
+-				mem_idx_mem_en  = 1'b0; 
+-				cnt_comp_idx_en = 1'b0;
+-			end
+-			axi_rd_rst_n			= 1'b1; 
+-			axi_rd_start			= 1'b0; 
+-			axi_rd_done_rst_n		= 1'b1;
+-			fifo_r_en				= 1'b0; 
+-			fifo_rst_n				= 1'b1; 
+-			mem_rst_n				= 1'b1;
+-			buffer_rst_n			= 1'b1; 
+-			buffer_data_in_valid	= 1'b0; 
+-			buffer_data_in_last     = 1'b0;
+-			axi_wr_rst_n            = 1'b1; 
+-			axi_wr_done_rst_n       = 1'b1; 
+-			rst_n_multi_burst		= 1'b1;
+-			cnt_row_rst_n           = 1'b1; 
+-			rd_b_mem           		= 1'b0; 
+-			piso_rst_n              = 1'b1;
+-			piso_load               = 1'b0; 
+-			piso_shift_en           = 1'b0; 
+-			comp_idx_ptr_old_en     = 1'b0;
+-			mux_comp_idx_sel        = 1'b0; 
+-			cnt_nnzs_en             = 1'b0; 
+-			cnt_nnzs_rst_n          = 1'b1;
+-			comp_idx_ptr_old_rst_n  = 1'b1; 
+-			cnt_stage_en            = 1'b0; 
+-			cnt_stage_rst_n         = 1'b1;
+-			cnt_comp_idx_rst_n      = 1'b1; 
+-			done					= 1'b0;
+-		end
+-		
+-		START_NEXT_AXI_ADDR : begin
+-			next_state = WAIT_AXI_RD;
+-			axi_rd_rst_n			= 1'b1; 
+-			axi_rd_start			= 1'b1; 
+-			axi_rd_done_rst_n		= 1'b0;
+-			fifo_r_en				= 1'b0; 
+-			fifo_rst_n				= 1'b1; 
+-			mem_rst_n				= 1'b1;
+-			mem_wr_en				= 1'b0; 
+-			mem_idx_wr_en			= 1'b0; 
+-			mem_idx_mem_en			= 1'b0;
+-			buffer_rst_n			= 1'b1; 
+-			buffer_data_in_valid	= 1'b0; 
+-			buffer_data_in_last     = 1'b0;
+-			axi_wr_rst_n            = 1'b1; 
+-			axi_wr_done_rst_n       = 1'b1; 
+-			rst_n_multi_burst		= 1'b1;
+-			cnt_row_en              = 1'b0; 
+-			cnt_row_rst_n           = 1'b1; 
+-			rd_b_mem           		= 1'b0;
+-			piso_rst_n              = 1'b1; 
+-			piso_load               = 1'b0; 
+-			piso_shift_en           = 1'b0;
+-			comp_idx_ptr_old_en     = 1'b0; 
+-			mux_comp_idx_sel        = 1'b0; 
+-			cnt_nnzs_en             = 1'b0;
+-			cnt_nnzs_rst_n          = 1'b1; 
+-			comp_idx_ptr_old_rst_n  = 1'b1; 
+-			cnt_stage_en            = 1'b0;
+-			cnt_stage_rst_n         = 1'b1; 
+-			cnt_comp_idx_en         = 1'b0; 
+-			cnt_comp_idx_rst_n      = 1'b1;
+-			done					= 1'b0;
+-		end
+-		
+-		REQ_MEM_1_PTR : begin
+-			next_state = RD_1_PTR;
+-			axi_rd_rst_n			= 1'b1; 
+-			axi_rd_start			= 1'b1; 
+-			axi_rd_done_rst_n		= 1'b0; 
+-			fifo_r_en				= 1'b0; 
+-			fifo_rst_n				= 1'b1; 
+-			mem_rst_n				= 1'b1;
+-			mem_wr_en				= 1'b0; 
+-			mem_idx_wr_en			= 1'b0; 
+-			mem_idx_mem_en			= 1'b1;
+-			buffer_rst_n			= 1'b1; 
+-			buffer_data_in_valid	= 1'b0; 
+-			buffer_data_in_last     = 1'b0;
+-			axi_wr_rst_n            = 1'b1; 
+-			axi_wr_done_rst_n       = 1'b1; 
+-			rst_n_multi_burst		= 1'b1;
+-			cnt_row_en              = 1'b0; 
+-			cnt_row_rst_n           = 1'b1; 
+-			rd_b_mem           		= 1'b1;
+-			piso_rst_n              = 1'b1; 
+-			piso_load               = 1'b0; 
+-			piso_shift_en           = 1'b0;
+-			comp_idx_ptr_old_en     = 1'b0; 
+-			mux_comp_idx_sel        = 1'b0; 
+-			cnt_nnzs_en             = 1'b0;
+-			cnt_nnzs_rst_n          = 1'b1; 
+-			comp_idx_ptr_old_rst_n  = 1'b1; 
+-			cnt_stage_en            = 1'b0;
+-			cnt_stage_rst_n         = 1'b1; 
+-			cnt_comp_idx_en         = 1'b0; 
+-			cnt_comp_idx_rst_n      = 1'b0;
+-			done					= 1'b0;
+-		end
+-		
+-		RD_1_PTR : begin
+-			next_state = RD_2_PTR;
+-			axi_rd_rst_n			= 1'b1; 
+-			axi_rd_start			= 1'b0; 
+-			axi_rd_done_rst_n		= 1'b1;
+-			fifo_r_en				= 1'b0; 
+-			fifo_rst_n				= 1'b1; 
+-			mem_rst_n				= 1'b1;
+-			mem_wr_en				= 1'b0; 
+-			mem_idx_wr_en			= 1'b0; 
+-			mem_idx_mem_en			= 1'b1;
+-			buffer_rst_n			= 1'b1; 
+-			buffer_data_in_valid	= 1'b0; 
+-			buffer_data_in_last     = 1'b0;
+-			axi_wr_rst_n            = 1'b1; 
+-			axi_wr_done_rst_n       = 1'b1; 
+-			rst_n_multi_burst		= 1'b1;
+-			cnt_row_en              = 1'b0; 
+-			cnt_row_rst_n           = 1'b1; 
+-			rd_b_mem           		= 1'b1;
+-			piso_rst_n              = 1'b1; 
+-			piso_load               = 1'b0; 
+-			piso_shift_en           = 1'b0;
+-			comp_idx_ptr_old_en     = 1'b1; 
+-			mux_comp_idx_sel        = 1'b0; 
+-			cnt_nnzs_en             = 1'b0;
+-			cnt_nnzs_rst_n          = 1'b1; 
+-			comp_idx_ptr_old_rst_n  = 1'b1; 
+-			cnt_stage_en            = 1'b0;
+-			cnt_stage_rst_n         = 1'b1; 
+-			cnt_comp_idx_en         = 1'b1; 
+-			cnt_comp_idx_rst_n      = 1'b1;
+-			done					= 1'b0;
+-		end
+-		
+-		RD_2_PTR : begin
+-			next_state = START_OP; 
+-			axi_rd_rst_n			= 1'b1; 
+-			axi_rd_start			= 1'b0; 
+-			axi_rd_done_rst_n		= 1'b1;
+-			fifo_r_en				= 1'b0; 
+-			fifo_rst_n				= 1'b1; 
+-			mem_rst_n				= 1'b1;
+-			mem_wr_en				= 1'b0; 
+-			mem_idx_wr_en			= 1'b0; 
+-			mem_idx_mem_en			= 1'b1;
+-			buffer_rst_n			= 1'b1; 
+-			buffer_data_in_valid	= 1'b0; 
+-			buffer_data_in_last     = 1'b0;
+-			axi_wr_rst_n            = 1'b1; 
+-			axi_wr_done_rst_n       = 1'b1; 
+-			rst_n_multi_burst		= 1'b1;
+-			cnt_row_en              = 1'b0; 
+-			cnt_row_rst_n           = 1'b1; 
+-			rd_b_mem           		= 1'b1;
+-			piso_rst_n              = 1'b1; 
+-			piso_load               = 1'b0; 
+-			piso_shift_en           = 1'b0;
+-			comp_idx_ptr_old_en     = 1'b1; 
+-			mux_comp_idx_sel        = 1'b0; 
+-			cnt_nnzs_en             = 1'b1;
+-			cnt_nnzs_rst_n          = 1'b1; 
+-			comp_idx_ptr_old_rst_n  = 1'b1; 
+-			cnt_stage_en            = 1'b0;
+-			cnt_stage_rst_n         = 1'b1; 
+-			cnt_comp_idx_en         = 1'b0; 
+-			cnt_comp_idx_rst_n      = 1'b1;
+-			done					= 1'b0;
+-		end
+-
+-		START_OP : begin
+-			// Last_index è valido solo se abbiamo già incontrato dati validi
+-			if (last_index && nnzs_check) begin 
+-				next_state = FLUSH_BUFFER;
+-			end else if (tc_nnzs) begin
+-				if (end_rd_index) next_state = FLUSH_BUFFER;
+-				else next_state = UPDATE_BLOCK;
+-			end else begin
+-				if (piso_empty) begin
+-					if (!fifo_empty) next_state = RD_FIFO;
+-					else next_state = START_OP;
+-				end else begin
+-					next_state = REQ_MEM_DATA; 
+-				end
+-			end
+-			axi_rd_rst_n			= 1'b1; 
+-			axi_rd_start			= 1'b0; 
+-			axi_rd_done_rst_n		= 1'b1;
+-			fifo_r_en				= 1'b0; 
+-			fifo_rst_n				= 1'b1; 
+-			mem_rst_n				= 1'b1;
+-			mem_wr_en				= 1'b0; 
+-			mem_idx_wr_en			= 1'b0; 
+-			mem_idx_mem_en			= 1'b1;
+-			buffer_rst_n			= 1'b1; 
+-			buffer_data_in_valid	= 1'b0; 
+-			buffer_data_in_last     = 1'b0;
+-			axi_wr_rst_n            = 1'b1; 
+-			axi_wr_done_rst_n       = 1'b1; 
+-			rst_n_multi_burst		= 1'b1;
+-			cnt_row_en              = 1'b0; 
+-			cnt_row_rst_n           = 1'b1; 
+-			rd_b_mem           		= 1'b1;
+-			piso_rst_n              = 1'b1; 
+-			piso_load               = 1'b0; 
+-			piso_shift_en           = 1'b0;
+-			comp_idx_ptr_old_en     = 1'b0; 
+-			mux_comp_idx_sel        = 1'b1; 
+-			cnt_nnzs_en             = 1'b0;
+-			cnt_nnzs_rst_n          = 1'b1; 
+-			comp_idx_ptr_old_rst_n  = 1'b1; 
+-			cnt_stage_en            = 1'b0;
+-			cnt_stage_rst_n         = 1'b1; 
+-			cnt_comp_idx_en         = 1'b0; 
+-			cnt_comp_idx_rst_n      = 1'b1;
+-			done					= 1'b0;
+-		end
+-
+-		RD_FIFO : begin
+-			next_state = LOAD_PISO;
+-			axi_rd_rst_n			= 1'b1; 
+-			axi_rd_start			= 1'b0; 
+-			axi_rd_done_rst_n		= 1'b1;
+-			fifo_r_en				= 1'b1; 
+-			fifo_rst_n				= 1'b1; 
+-			mem_rst_n				= 1'b1;
+-			mem_wr_en				= 1'b0; 
+-			mem_idx_wr_en			= 1'b0; 
+-			mem_idx_mem_en			= 1'b1;
+-			buffer_rst_n			= 1'b1; 
+-			buffer_data_in_valid	= 1'b0; 
+-			buffer_data_in_last     = 1'b0;
+-			axi_wr_rst_n            = 1'b1; 
+-			axi_wr_done_rst_n       = 1'b1; 
+-			rst_n_multi_burst		= 1'b1;
+-			cnt_row_en              = 1'b0; 
+-			cnt_row_rst_n           = 1'b1; 
+-			rd_b_mem           		= 1'b1;
+-			piso_rst_n              = 1'b1; 
+-			piso_load               = 1'b0; 
+-			piso_shift_en           = 1'b0;
+-			comp_idx_ptr_old_en     = 1'b0; 
+-			mux_comp_idx_sel        = 1'b1; 
+-			cnt_nnzs_en             = 1'b0;
+-			cnt_nnzs_rst_n          = 1'b1; 
+-			comp_idx_ptr_old_rst_n  = 1'b1; 
+-			cnt_stage_en            = 1'b0;
+-			cnt_stage_rst_n         = 1'b1; 
+-			cnt_comp_idx_en         = 1'b0; 
+-			cnt_comp_idx_rst_n      = 1'b1;
+-			done					= 1'b0;
+-		end
+-
+-		LOAD_PISO : begin
+-			next_state = REQ_MEM_DATA; 
+-			axi_rd_rst_n			= 1'b1; 
+-			axi_rd_start			= 1'b0; 
+-			axi_rd_done_rst_n		= 1'b1;
+-			fifo_r_en				= 1'b0; 
+-			fifo_rst_n				= 1'b1; 
+-			mem_rst_n				= 1'b1;
+-			mem_wr_en				= 1'b0; 
+-			mem_idx_wr_en			= 1'b0; 
+-			mem_idx_mem_en			= 1'b1;
+-			buffer_rst_n			= 1'b1; 
+-			buffer_data_in_valid	= 1'b0; 
+-			buffer_data_in_last     = 1'b0;
+-			axi_wr_rst_n            = 1'b1; 
+-			axi_wr_done_rst_n       = 1'b1; 
+-			rst_n_multi_burst		= 1'b1;
+-			cnt_row_en              = 1'b0; 
+-			cnt_row_rst_n           = 1'b1; 
+-			rd_b_mem           		= 1'b1;
+-			piso_rst_n              = 1'b1; 
+-			piso_load               = 1'b1; 
+-			piso_shift_en           = 1'b0;
+-			comp_idx_ptr_old_en     = 1'b0; 
+-			mux_comp_idx_sel        = 1'b1; 
+-			cnt_nnzs_en             = 1'b0;
+-			cnt_nnzs_rst_n          = 1'b1; 
+-			comp_idx_ptr_old_rst_n  = 1'b1; 
+-			cnt_stage_en            = 1'b0;
+-			cnt_stage_rst_n         = 1'b1; 
+-			cnt_comp_idx_en         = 1'b0; 
+-			cnt_comp_idx_rst_n      = 1'b1;
+-			done					= 1'b0;
+-		end
+-
+-		REQ_MEM_DATA : begin
+-			if (axi_rd_done && !tc_rd_index) begin
+-				next_state = CLR_AXI_RD_DONE;
+-			end else if (tc_nnzs) begin
+-				if (end_rd_index) next_state = FLUSH_BUFFER;
+-				else              next_state = UPDATE_BLOCK;
+-			end else if (piso_empty) begin
+-				if (!fifo_empty)  next_state = RD_FIFO;
+-				else              next_state = REQ_MEM_DATA;
+-			end else begin
+-				next_state = WR_BUFFER;
+-			end
+-
+-			axi_rd_rst_n			= 1'b1; 
+-			axi_rd_start			= 1'b0; 
+-			axi_rd_done_rst_n		= 1'b1;
+-			fifo_r_en				= 1'b0; 
+-			fifo_rst_n				= 1'b1; 
+-			mem_rst_n				= 1'b1;
+-			mem_wr_en				= 1'b0; 
+-			mem_idx_wr_en			= 1'b0; 
+-			mem_idx_mem_en			= 1'b1;
+-			buffer_rst_n			= 1'b1; 
+-			buffer_data_in_valid	= 1'b0; 
+-			buffer_data_in_last     = 1'b0;
+-			axi_wr_rst_n            = 1'b1; 
+-			axi_wr_done_rst_n       = 1'b1; 
+-			rst_n_multi_burst		= 1'b1;
+-			cnt_row_en              = 1'b0; 
+-			cnt_row_rst_n           = 1'b1; 
+-			rd_b_mem           		= 1'b1;
+-			piso_rst_n              = 1'b1; 
+-			piso_load               = 1'b0; 
+-			piso_shift_en           = 1'b0;
+-			comp_idx_ptr_old_en     = 1'b0; 
+-			mux_comp_idx_sel        = 1'b1; 
+-			cnt_nnzs_en             = 1'b0;
+-			cnt_nnzs_rst_n          = 1'b1; 
+-			comp_idx_ptr_old_rst_n  = 1'b1; 
+-			cnt_stage_en            = 1'b0;
+-			cnt_stage_rst_n         = 1'b1; 
+-			cnt_comp_idx_en         = 1'b0; 
+-			cnt_comp_idx_rst_n      = 1'b1;
+-			done					= 1'b0;
+-		end
+-
+-		WR_BUFFER : begin
+-			axi_rd_rst_n			= 1'b1; 
+-			axi_rd_start			= 1'b0; 
+-			axi_rd_done_rst_n		= 1'b1;
+-			fifo_rst_n				= 1'b1; 
+-			mem_rst_n				= 1'b1; 
+-			mem_wr_en				= 1'b0;
+-			mem_idx_wr_en			= 1'b0; 
+-			mem_idx_mem_en			= 1'b1; 
+-			buffer_rst_n			= 1'b1;
+-			buffer_data_in_last     = 1'b0; 
+-			axi_wr_rst_n            = 1'b1; 
+-			axi_wr_done_rst_n       = 1'b1;
+-			rst_n_multi_burst		= 1'b1; 
+-			cnt_row_en              = 1'b0; 
+-			cnt_row_rst_n           = 1'b1;
+-			rd_b_mem           		= 1'b1; 
+-			piso_rst_n              = 1'b1; 
+-			piso_load               = 1'b0;
+-			comp_idx_ptr_old_en     = 1'b0; 
+-			comp_idx_ptr_old_rst_n  = 1'b1; 
+-			cnt_nnzs_rst_n          = 1'b1;
+-			mux_comp_idx_sel        = 1'b1; 
+-			cnt_stage_en            = 1'b0; 
+-			cnt_stage_rst_n         = 1'b1;
+-			cnt_comp_idx_en         = 1'b0; 
+-			cnt_comp_idx_rst_n      = 1'b1; 
+-			done					= 1'b0; 
+-			
+-			if (buffer_wait_wr) begin
+-				next_state           = WR_BUFFER;
+-				fifo_r_en            = 1'b0;
+-				piso_shift_en        = 1'b0;
+-				cnt_nnzs_en          = 1'b0;
+-				buffer_data_in_valid = 1'b0;
+-			end else begin
+-				buffer_data_in_valid = 1'b1;
+-				piso_shift_en        = 1'b1;
+-				cnt_nnzs_en          = 1'b1;
+-				fifo_r_en            = 1'b0;
+-				next_state           = REQ_MEM_DATA;
+-			end
+-		end
+-
+-		CLR_AXI_RD_DONE : begin
+-			next_state = AXI_RD_NEXT_ADDR;
+-			axi_rd_rst_n			= 1'b1; 
+-			axi_rd_start			= 1'b0; 
+-			axi_rd_done_rst_n		= 1'b0; 
+-			fifo_r_en				= 1'b0; 
+-			fifo_rst_n				= 1'b1; 
+-			mem_rst_n				= 1'b1;
+-			mem_wr_en				= 1'b0; 
+-			mem_idx_wr_en			= 1'b0; 
+-			mem_idx_mem_en			= 1'b1;
+-			buffer_rst_n			= 1'b1; 
+-			buffer_data_in_valid	= 1'b0; 
+-			buffer_data_in_last     = 1'b0;
+-			axi_wr_rst_n            = 1'b1; 
+-			axi_wr_done_rst_n       = 1'b1; 
+-			rst_n_multi_burst		= 1'b1;
+-			cnt_row_en              = 1'b0; 
+-			cnt_row_rst_n           = 1'b1; 
+-			rd_b_mem           		= 1'b1;
+-			piso_rst_n              = 1'b1; 
+-			piso_load               = 1'b0; 
+-			piso_shift_en           = 1'b0;
+-			comp_idx_ptr_old_en     = 1'b0; 
+-			mux_comp_idx_sel        = 1'b1; 
+-			cnt_nnzs_en             = 1'b0;
+-			cnt_nnzs_rst_n          = 1'b1; 
+-			comp_idx_ptr_old_rst_n  = 1'b1; 
+-			cnt_stage_en            = 1'b0;
+-			cnt_stage_rst_n         = 1'b1; 
+-			cnt_comp_idx_en         = 1'b0; 
+-			cnt_comp_idx_rst_n      = 1'b1;
+-			done					= 1'b0;
+-		end
+-
+-		AXI_RD_NEXT_ADDR : begin
+-			next_state = REQ_MEM_DATA;
+-			axi_rd_rst_n			= 1'b1; 
+-			axi_rd_start			= 1'b1; 
+-			axi_rd_done_rst_n		= 1'b1; 
+-			fifo_r_en				= 1'b0; 
+-			fifo_rst_n				= 1'b1; 
+-			mem_rst_n				= 1'b1;
+-			mem_wr_en				= 1'b0; 
+-			mem_idx_wr_en			= 1'b0; 
+-			mem_idx_mem_en			= 1'b1;
+-			buffer_rst_n			= 1'b1; 
+-			buffer_data_in_valid	= 1'b0; 
+-			buffer_data_in_last     = 1'b0;
+-			axi_wr_rst_n            = 1'b1; 
+-			axi_wr_done_rst_n       = 1'b1; 
+-			rst_n_multi_burst		= 1'b1;
+-			cnt_row_en              = 1'b0; 
+-			cnt_row_rst_n           = 1'b1; 
+-			rd_b_mem           		= 1'b1;
+-			piso_rst_n              = 1'b1; 
+-			piso_load               = 1'b0; 
+-			piso_shift_en           = 1'b0;
+-			comp_idx_ptr_old_en     = 1'b0; 
+-			mux_comp_idx_sel        = 1'b1; 
+-			cnt_nnzs_en             = 1'b0;
+-			cnt_nnzs_rst_n          = 1'b1; 
+-			comp_idx_ptr_old_rst_n  = 1'b1; 
+-			cnt_stage_en            = 1'b0;
+-			cnt_stage_rst_n         = 1'b1; 
+-			cnt_comp_idx_en         = 1'b0; 
+-			cnt_comp_idx_rst_n      = 1'b1;
+-			done					= 1'b0;
+-		end
+-
+-		UPDATE_BLOCK : begin
+-			next_state = REQ_MEM_NEW_PTR;
+-			axi_rd_rst_n			= 1'b1; 
+-			axi_rd_start			= 1'b0; 
+-			axi_rd_done_rst_n		= 1'b1;
+-			fifo_r_en				= 1'b0; 
+-			fifo_rst_n				= 1'b1; 
+-			mem_rst_n				= 1'b1;
+-			mem_wr_en				= 1'b0; 
+-			mem_idx_wr_en			= 1'b0; 
+-			mem_idx_mem_en			= 1'b1;
+-			buffer_rst_n			= 1'b1; 
+-			buffer_data_in_valid	= 1'b0; 
+-			buffer_data_in_last     = 1'b0;
+-			axi_wr_rst_n            = 1'b1; 
+-			axi_wr_done_rst_n       = 1'b1; 
+-			rst_n_multi_burst		= 1'b1;
+-			cnt_row_en              = 1'b0; 
+-			cnt_row_rst_n           = 1'b1; 
+-			rd_b_mem           		= 1'b1;
+-			piso_rst_n              = 1'b1; 
+-			piso_load               = 1'b0; 
+-			piso_shift_en           = 1'b0;
+-			comp_idx_ptr_old_en     = 1'b0; 
+-			mux_comp_idx_sel        = 1'b0; 
+-			cnt_nnzs_en             = 1'b0;
+-			cnt_nnzs_rst_n          = 1'b1; 
+-			comp_idx_ptr_old_rst_n  = 1'b1; 
+-			cnt_stage_en            = 1'b1;
+-			cnt_stage_rst_n         = 1'b1; 
+-			cnt_comp_idx_en         = 1'b1; 
+-			cnt_comp_idx_rst_n      = 1'b1;
+-			done					= 1'b0;
+-		end
+-		
+-		REQ_MEM_NEW_PTR : begin
+-			next_state = RD_2_PTR;
+-			axi_rd_rst_n			= 1'b1; 
+-			axi_rd_start			= 1'b0; 
+-			axi_rd_done_rst_n		= 1'b1;
+-			fifo_r_en				= 1'b0; 
+-			fifo_rst_n				= 1'b1; 
+-			mem_rst_n				= 1'b1;
+-			mem_wr_en				= 1'b0; 
+-			mem_idx_wr_en			= 1'b0; 
+-			mem_idx_mem_en			= 1'b1;
+-			buffer_rst_n			= 1'b1; 
+-			buffer_data_in_valid	= 1'b0; 
+-			buffer_data_in_last     = 1'b0;
+-			axi_wr_rst_n            = 1'b1; 
+-			axi_wr_done_rst_n       = 1'b1; 
+-			rst_n_multi_burst		= 1'b1;
+-			cnt_row_en              = 1'b0; 
+-			cnt_row_rst_n           = 1'b1; 
+-			rd_b_mem           		= 1'b1;
+-			piso_rst_n              = 1'b1; 
+-			piso_load               = 1'b0; 
+-			piso_shift_en           = 1'b0;
+-			comp_idx_ptr_old_en     = 1'b0; 
+-			mux_comp_idx_sel        = 1'b0; 
+-			cnt_nnzs_en             = 1'b0;
+-			cnt_nnzs_rst_n          = 1'b1; 
+-			comp_idx_ptr_old_rst_n  = 1'b1; 
+-			cnt_stage_en            = 1'b0;
+-			cnt_stage_rst_n         = 1'b1; 
+-			cnt_comp_idx_en         = 1'b0; 
+-			cnt_comp_idx_rst_n      = 1'b1;
+-			done					= 1'b0;
+-		end
+-		
+-		FLUSH_BUFFER : begin
+-			next_state = WAIT_AXI_WR;
+-			axi_rd_rst_n			= 1'b1; 
+-			axi_rd_start			= 1'b0; 
+-			axi_rd_done_rst_n		= 1'b1;
+-			fifo_r_en				= 1'b0; 
+-			fifo_rst_n				= 1'b1; 
+-			mem_rst_n				= 1'b1;
+-			mem_wr_en				= 1'b0; 
+-			mem_idx_wr_en			= 1'b0; 
+-			mem_idx_mem_en			= 1'b1;
+-			buffer_rst_n			= 1'b1; 
+-			buffer_data_in_valid	= 1'b0; 
+-			buffer_data_in_last     = 1'b1;
+-			axi_wr_rst_n            = 1'b1; 
+-			axi_wr_done_rst_n       = 1'b0; 
+-			rst_n_multi_burst		= 1'b1;
+-			cnt_row_en              = 1'b0; 
+-			cnt_row_rst_n           = 1'b1; 
+-			rd_b_mem           		= 1'b1;
+-			piso_rst_n              = 1'b1; 
+-			piso_load               = 1'b0; 
+-			piso_shift_en           = 1'b0;
+-			comp_idx_ptr_old_en     = 1'b0; 
+-			mux_comp_idx_sel        = 1'b1; 
+-			cnt_nnzs_en             = 1'b0;
+-			cnt_nnzs_rst_n          = 1'b1; 
+-			comp_idx_ptr_old_rst_n  = 1'b1; 
+-			cnt_stage_en            = 1'b0;
+-			cnt_stage_rst_n         = 1'b1; 
+-			cnt_comp_idx_en         = 1'b0; 
+-			cnt_comp_idx_rst_n      = 1'b1;
+-			done					= 1'b0;
+-		end
+-		
+-		WAIT_AXI_WR : begin
+-			if (axi_wr_done) begin
+-				if (!buffer_data_out_valid) begin
+-					axi_wr_done_rst_n	= 1'b1; 
+-					next_state = DONE;
+-				end else begin
+-					axi_wr_done_rst_n	= 1'b0; 
+-					next_state = WAIT_AXI_WR;
+-				end
+-			end else begin
+-				next_state = WAIT_AXI_WR; 
+-				axi_wr_done_rst_n	= 1'b1;
+-			end
+-			axi_rd_rst_n			= 1'b1; 
+-			axi_rd_start			= 1'b0; 
+-			axi_rd_done_rst_n		= 1'b1;
+-			fifo_r_en				= 1'b0; 
+-			fifo_rst_n				= 1'b1; 
+-			mem_rst_n				= 1'b1;
+-			mem_wr_en				= 1'b0; 
+-			mem_idx_wr_en			= 1'b0; 
+-			mem_idx_mem_en			= 1'b0;
+-			buffer_rst_n			= 1'b1; 
+-			buffer_data_in_valid	= 1'b0; 
+-			buffer_data_in_last     = 1'b0;
+-			axi_wr_rst_n            = 1'b1; 
+-			rst_n_multi_burst		= 1'b1;
+-			cnt_row_en              = 1'b0; 
+-			cnt_row_rst_n           = 1'b1; 
+-			rd_b_mem           		= 1'b1;
+-			piso_rst_n              = 1'b1; 
+-			piso_load               = 1'b0; 
+-			piso_shift_en           = 1'b0;
+-			comp_idx_ptr_old_en     = 1'b0; 
+-			mux_comp_idx_sel        = 1'b1; 
+-			cnt_nnzs_en             = 1'b0;
+-			cnt_nnzs_rst_n          = 1'b1; 
+-			comp_idx_ptr_old_rst_n  = 1'b1; 
+-			cnt_stage_en            = 1'b0;
+-			cnt_stage_rst_n         = 1'b1; 
+-			cnt_comp_idx_en         = 1'b0; 
+-			cnt_comp_idx_rst_n      = 1'b1;
+-			done					= 1'b0;
+-		end
+-		
+-		DONE : begin
+-			next_state = IDLE;
+-			axi_rd_rst_n			= 1'b0; 
+-			axi_rd_start			= 1'b0; 
+-			axi_rd_done_rst_n		= 1'b0;
+-			fifo_r_en				= 1'b0; 
+-			fifo_rst_n				= 1'b0; 
+-			mem_rst_n				= 1'b0;
+-			mem_wr_en				= 1'b0; 
+-			mem_idx_wr_en			= 1'b0; 
+-			mem_idx_mem_en			= 1'b0;
+-			buffer_rst_n			= 1'b0; 
+-			buffer_data_in_valid	= 1'b0; 
+-			buffer_data_in_last     = 1'b0;
+-			axi_wr_rst_n            = 1'b0; 
+-			axi_wr_done_rst_n       = 1'b0; 
+-			rst_n_multi_burst		= 1'b0;
+-			cnt_row_en              = 1'b0; 
+-			cnt_row_rst_n           = 1'b0; 
+-			rd_b_mem           		= 1'b0;
+-			piso_rst_n              = 1'b0; 
+-			piso_load               = 1'b0; 
+-			piso_shift_en           = 1'b0;
+-			comp_idx_ptr_old_en     = 1'b0; 
+-			mux_comp_idx_sel        = 1'b0; 
+-			cnt_nnzs_en             = 1'b0;
+-			cnt_nnzs_rst_n          = 1'b0; 
+-			comp_idx_ptr_old_rst_n  = 1'b0; 
+-			cnt_stage_en            = 1'b0;
+-			cnt_stage_rst_n         = 1'b0; 
+-			cnt_comp_idx_en         = 1'b0; 
+-			cnt_comp_idx_rst_n      = 1'b0;
+-			done					= 1'b1;
+-		end
+-		
+-		default : begin
+-			next_state = IDLE;
+-			axi_rd_rst_n			= 1'b0; 
+-			axi_rd_start			= 1'b0; 
+-			axi_rd_done_rst_n		= 1'b0;
+-			fifo_r_en				= 1'b0; 
+-			fifo_rst_n				= 1'b0; 
+-			mem_rst_n				= 1'b0;
+-			mem_wr_en				= 1'b0; 
+-			mem_idx_wr_en			= 1'b0; 
+-			mem_idx_mem_en			= 1'b0;
+-			buffer_rst_n			= 1'b0; 
+-			buffer_data_in_valid	= 1'b0; 
+-			buffer_data_in_last     = 1'b0;
+-			axi_wr_rst_n            = 1'b0; 
+-			axi_wr_done_rst_n       = 1'b0; 
+-			rst_n_multi_burst		= 1'b0;
+-			cnt_row_en              = 1'b0; 
+-			cnt_row_rst_n           = 1'b0; 
+-			rd_b_mem           		= 1'b0;
+-			piso_rst_n              = 1'b0; 
+-			piso_load               = 1'b0; 
+-			piso_shift_en           = 1'b0;
+-			comp_idx_ptr_old_en     = 1'b0; 
+-			mux_comp_idx_sel        = 1'b0; 
+-			cnt_nnzs_en             = 1'b0;
+-			cnt_nnzs_rst_n          = 1'b0; 
+-			comp_idx_ptr_old_rst_n  = 1'b0; 
+-			cnt_stage_en            = 1'b0;
+-			cnt_stage_rst_n         = 1'b0; 
+-			cnt_comp_idx_en         = 1'b0; 
+-			cnt_comp_idx_rst_n      = 1'b0;
+-			done					= 1'b0;
+-		end
+-		
+-	endcase
+-end
+-
+-endmodule
++`timescale 1ns/1ps
++
++module accel_cu (
++    input  logic clk,
++    input  logic rst_n,
++    input  logic start,
++    output logic done,
++
++    // AXI4 read.
++    output logic axi_rd_rst_n,
++    output logic axi_rd_start,
++    input  logic axi_rd_available,
++    input  logic axi_rd_done,
++    output logic axi_rd_done_rst_n,
++
++    // Shared FIFO during preload.
++    output logic fifo_r_en,
++    output logic fifo_rst_n,
++    input  logic fifo_empty,
++
++    // Internal memories.
++    output logic mem_rst_n,
++    output logic mem_wr_en,
++    output logic mem_idx_wr_en,
++    output logic dense_rd_req,
++    input  logic dense_req_ready,
++    input  logic dense_pipe_empty,
++
++    // Output buffer.
++    output logic buffer_rst_n,
++    output logic buffer_data_in_last,
++    input  logic buffer_data_out_valid,
++
++    // AXI4 write.
++    output logic axi_wr_rst_n,
++    input  logic axi_wr_done,
++    output logic axi_wr_done_rst_n,
++    output logic rst_n_multi_burst,
++
++    // AXI-read phase status.
++    input  logic tc_wr_mem,
++    input  logic wr_index,
++    input  logic tc_rd_index,
++
++    // Dense preload address.
++    output logic cnt_row_en,
++    output logic cnt_row_rst_n,
++    output logic rd_b_mem,
++
++    // Index PISO.
++    output logic piso_rst_n,
++    output logic piso_load,
++    output logic piso_shift_en,
++    input  logic piso_empty,
++
++    // Pointer look-ahead and segment scheduler.
++    output logic ptr_stream_enable,
++    output logic ptr_stream_rst_n,
++    output logic segment_advance,
++    input  logic segment_valid,
++    input  logic segment_done,
++    input  logic stream_end,
++    input  logic end_rd_index,
++
++    // SpMM bank stage.
++    output logic cnt_stage_en,
++    output logic cnt_stage_rst_n,
++
++    // Pointer-SRAM preload address.
++    output logic cnt_comp_idx_en,
++    output logic cnt_comp_idx_rst_n
++);
++
++typedef enum logic [4:0] {
++    IDLE,
++    START,
++    WAIT_AXI_RD,
++    RD_FIFO_WR_MEM,
++    WR_B,
++    WR_LAST_DATA,
++    START_NEXT_AXI_ADDR,
++    PTR_STREAM_RESET,
++    PTR_STREAM_FILL,
++    RUN,
++    CLR_AXI_RD_DONE,
++    AXI_RD_NEXT_ADDR,
++    DRAIN,
++    CLR_AXI_RD_DONE_DRAIN,
++    AXI_RD_NEXT_ADDR_DRAIN,
++    FLUSH_BUFFER,
++    WAIT_AXI_WR,
++    DONE
++} state_e;
++
++state_e current_state;
++state_e next_state;
++
++logic fifo_data_vld_q;
++logic issued_any_q;
++
++always_ff @(posedge clk or negedge rst_n) begin
++    if (!rst_n) begin
++        fifo_data_vld_q <= 1'b0;
++    end else begin
++        fifo_data_vld_q <= fifo_r_en;
++    end
++end
++
++always_ff @(posedge clk or negedge rst_n) begin
++    if (!rst_n) begin
++        current_state <= IDLE;
++    end else begin
++        current_state <= next_state;
++    end
++end
++
++always_ff @(posedge clk or negedge rst_n) begin
++    if (!rst_n) begin
++        issued_any_q <= 1'b0;
++    end else if ((current_state == IDLE) || (current_state == START)) begin
++        issued_any_q <= 1'b0;
++    end else if (dense_rd_req) begin
++        issued_any_q <= 1'b1;
++    end
++end
++
++always_comb begin
++    // Active defaults.  Individual states only override the controls they
++    // own, avoiding the duplicated thousand-line output table of the legacy
++    // FSM.
++    next_state = current_state;
++
++    axi_rd_rst_n = 1'b1;
++    axi_rd_start = 1'b0;
++    axi_rd_done_rst_n = 1'b1;
++
++    fifo_r_en = 1'b0;
++    fifo_rst_n = 1'b1;
++
++    mem_rst_n = 1'b1;
++    mem_wr_en = 1'b0;
++    mem_idx_wr_en = 1'b0;
++    dense_rd_req = 1'b0;
++
++    buffer_rst_n = 1'b1;
++    buffer_data_in_last = 1'b0;
++
++    axi_wr_rst_n = 1'b1;
++    axi_wr_done_rst_n = 1'b1;
++    rst_n_multi_burst = 1'b1;
++
++    cnt_row_en = 1'b0;
++    cnt_row_rst_n = 1'b1;
++    rd_b_mem = 1'b0;
++
++    piso_rst_n = 1'b1;
++    piso_load = 1'b0;
++    piso_shift_en = 1'b0;
++
++    ptr_stream_enable = 1'b0;
++    ptr_stream_rst_n = 1'b0;
++    segment_advance = 1'b0;
++
++    cnt_stage_en = 1'b0;
++    cnt_stage_rst_n = 1'b1;
++
++    cnt_comp_idx_en = 1'b0;
++    cnt_comp_idx_rst_n = 1'b1;
++
++    done = 1'b0;
++
++    unique case (current_state)
++        IDLE: begin
++            next_state = start ? START : IDLE;
++
++            axi_rd_rst_n = 1'b0;
++            axi_rd_done_rst_n = 1'b0;
++            fifo_rst_n = 1'b0;
++            mem_rst_n = 1'b0;
++            buffer_rst_n = 1'b0;
++            axi_wr_rst_n = 1'b0;
++            axi_wr_done_rst_n = 1'b0;
++            rst_n_multi_burst = 1'b0;
++            cnt_row_rst_n = 1'b0;
++            piso_rst_n = 1'b0;
++            ptr_stream_rst_n = 1'b0;
++            cnt_stage_rst_n = 1'b0;
++            cnt_comp_idx_rst_n = 1'b0;
++        end
++
++        START: begin
++            next_state = WAIT_AXI_RD;
++            axi_rd_start = 1'b1;
++        end
++
++        WAIT_AXI_RD: begin
++            if (!fifo_empty) begin
++                next_state = RD_FIFO_WR_MEM;
++            end
++        end
++
++        RD_FIFO_WR_MEM: begin
++            fifo_r_en = 1'b1;
++            next_state = WR_B;
++        end
++
++        WR_B: begin
++            fifo_r_en = !fifo_empty;
++
++            if (wr_index) begin
++                mem_idx_wr_en = fifo_data_vld_q;
++                cnt_comp_idx_en = fifo_data_vld_q;
++            end else begin
++                mem_wr_en = fifo_data_vld_q;
++                cnt_row_en = fifo_data_vld_q;
++            end
++
++            if (axi_rd_done && axi_rd_available
++                    && fifo_empty && !fifo_data_vld_q) begin
++                next_state = WR_LAST_DATA;
++            end
++        end
++
++        WR_LAST_DATA: begin
++            if (wr_index) begin
++                mem_idx_wr_en = fifo_data_vld_q;
++                cnt_comp_idx_en = fifo_data_vld_q;
++            end else begin
++                mem_wr_en = fifo_data_vld_q;
++                cnt_row_en = fifo_data_vld_q;
++            end
++
++            next_state = tc_wr_mem
++                       ? PTR_STREAM_RESET
++                       : START_NEXT_AXI_ADDR;
++        end
++
++        START_NEXT_AXI_ADDR: begin
++            axi_rd_start = 1'b1;
++            axi_rd_done_rst_n = 1'b0;
++            next_state = WAIT_AXI_RD;
++        end
++
++        PTR_STREAM_RESET: begin
++            // Start the index AXI stream while resetting the autonomous
++            // compressed-pointer prefetcher.
++            rd_b_mem = 1'b1;
++            piso_load = 1'b1;
++            ptr_stream_rst_n = 1'b0;
++            cnt_comp_idx_rst_n = 1'b0;
++            axi_rd_start = 1'b1;
++            axi_rd_done_rst_n = 1'b0;
++            next_state = PTR_STREAM_FILL;
++        end
++
++        PTR_STREAM_FILL: begin
++            rd_b_mem = 1'b1;
++            piso_load = 1'b1;
++            ptr_stream_rst_n = 1'b1;
++            ptr_stream_enable = 1'b1;
++
++            if (axi_rd_done && !tc_rd_index) begin
++                next_state = CLR_AXI_RD_DONE;
++            end else if (stream_end || end_rd_index) begin
++                next_state = DRAIN;
++            end else if (segment_valid) begin
++                next_state = RUN;
++            end
++        end
++
++        RUN: begin
++            rd_b_mem = 1'b1;
++            piso_load = 1'b1;
++            ptr_stream_rst_n = 1'b1;
++            ptr_stream_enable = 1'b1;
++
++            if (axi_rd_done && !tc_rd_index) begin
++                next_state = CLR_AXI_RD_DONE;
++            end else if (stream_end || end_rd_index) begin
++                next_state = DRAIN;
++            end else if (!segment_valid) begin
++                next_state = PTR_STREAM_FILL;
++            end else if (segment_done) begin
++                // Pointer look-ahead has already computed the next segment.
++                // This advances empty rows at one row per cycle.
++                segment_advance = 1'b1;
++                cnt_stage_en = 1'b1;
++            end else if (!piso_empty && dense_req_ready) begin
++                // Request acceptance, PISO consumption, and segment-count
++                // decrement are the same event.
++                dense_rd_req = 1'b1;
++                piso_shift_en = 1'b1;
++            end
++        end
++
++        CLR_AXI_RD_DONE: begin
++            rd_b_mem = 1'b1;
++            piso_load = 1'b1;
++            ptr_stream_rst_n = 1'b1;
++            ptr_stream_enable = 1'b1;
++            axi_rd_done_rst_n = 1'b0;
++            next_state = AXI_RD_NEXT_ADDR;
++        end
++
++        AXI_RD_NEXT_ADDR: begin
++            rd_b_mem = 1'b1;
++            piso_load = 1'b1;
++            ptr_stream_rst_n = 1'b1;
++            ptr_stream_enable = 1'b1;
++            axi_rd_start = 1'b1;
++            next_state = RUN;
++        end
++
++        DRAIN: begin
++            rd_b_mem = 1'b1;
++            piso_load = 1'b1;
++            ptr_stream_rst_n = 1'b1;
++
++            if (axi_rd_done && !tc_rd_index) begin
++                next_state = CLR_AXI_RD_DONE_DRAIN;
++            end else if (dense_pipe_empty && tc_rd_index) begin
++                next_state = FLUSH_BUFFER;
++            end
++        end
++
++        CLR_AXI_RD_DONE_DRAIN: begin
++            rd_b_mem = 1'b1;
++            ptr_stream_rst_n = 1'b1;
++            axi_rd_done_rst_n = 1'b0;
++            next_state = AXI_RD_NEXT_ADDR_DRAIN;
++        end
++
++        AXI_RD_NEXT_ADDR_DRAIN: begin
++            rd_b_mem = 1'b1;
++            ptr_stream_rst_n = 1'b1;
++            axi_rd_start = 1'b1;
++            next_state = DRAIN;
++        end
++
++        FLUSH_BUFFER: begin
++            rd_b_mem = 1'b1;
++            ptr_stream_rst_n = 1'b1;
++            buffer_data_in_last = 1'b1;
++            axi_wr_done_rst_n = 1'b0;
++            next_state = WAIT_AXI_WR;
++        end
++
++        WAIT_AXI_WR: begin
++            rd_b_mem = 1'b1;
++            ptr_stream_rst_n = 1'b1;
++
++            if (!issued_any_q) begin
++                next_state = DONE;
++            end else if (axi_wr_done) begin
++                if (!buffer_data_out_valid) begin
++                    next_state = DONE;
++                end else begin
++                    axi_wr_done_rst_n = 1'b0;
++                end
++            end
++        end
++
++        DONE: begin
++            next_state = IDLE;
++            done = 1'b1;
++
++            axi_rd_rst_n = 1'b0;
++            axi_rd_done_rst_n = 1'b0;
++            fifo_rst_n = 1'b0;
++            mem_rst_n = 1'b0;
++            buffer_rst_n = 1'b0;
++            axi_wr_rst_n = 1'b0;
++            axi_wr_done_rst_n = 1'b0;
++            rst_n_multi_burst = 1'b0;
++            cnt_row_rst_n = 1'b0;
++            piso_rst_n = 1'b0;
++            ptr_stream_rst_n = 1'b0;
++            cnt_stage_rst_n = 1'b0;
++            cnt_comp_idx_rst_n = 1'b0;
++        end
++
++        default: begin
++            next_state = IDLE;
++        end
++    endcase
++end
++
++// pragma translate_off
++assert property (@(posedge clk) disable iff (!rst_n)
++    dense_rd_req |-> dense_req_ready && !piso_empty
++                    && segment_valid && !segment_done);
++
++assert property (@(posedge clk) disable iff (!rst_n)
++    segment_advance |-> segment_valid && segment_done);
++
++assert property (@(posedge clk) disable iff (!rst_n)
++    (current_state == FLUSH_BUFFER) |-> dense_pipe_empty);
++// pragma translate_on
++
++endmodule
+diff --git a/RTL/src/Gather/accel_dp.sv b/RTL/src/Gather/accel_dp.sv
+index fe4df86..b6ed659 100644
+--- a/RTL/src/Gather/accel_dp.sv
++++ b/RTL/src/Gather/accel_dp.sv
+@@ -1,346 +1,453 @@
+-module accel_dp #(
+-	parameter int unsigned AXI_ADDR_W 		= 32,
+-	parameter int unsigned AXI_DATA_SIZE 	= 64,
+-	parameter int FIFO_DEPTH 				= 16,    // Numero di locazioni
+-	parameter int FIFO_THRESHOLD 			= 8,	// Soglia impostata a metà
+-	parameter int unsigned NumWords_idx		= 16,   // Numero di word totali nella SRAM degli indici compressi
+-	parameter int unsigned ByteWidth_idx 	= 32,    // Larghezza del singolo byte di indici compressi 
+-    parameter int unsigned NumWords 		= 16,   // Numero di word totali nella SRAM singola
+-	parameter int unsigned ByteWidth 		= 32,    // Larghezza del singolo byte 
+-	parameter int unsigned NumPorts			= 1,    // Numero di porte
+-	parameter int unsigned Latency 			= 1,    // Latenza di lettura 
+-	parameter int N_BLOCKS 					= 8,
+-	parameter int BUFFER_BIT_ADDR 			= 4
+-	// PARAMETRI DIPENDENTI
+-)(
+-	input  	logic 				clk, rst_n,
+-	input 	logic				is_spmm,
+-	// INTERFACCIA AXI4 READ
+-	input  	logic 								axi_rd_rst_n, // From CU
+-	input  	logic              					axi_rd_start,  		// Richiesta di lettura valida (From CU)
+-	input	logic [2:0]        					ar_size_in,
+-	input 	logic [AXI_ADDR_W-1:0] 				ar_addr_dense_matrix,
+-	input 	logic [AXI_ADDR_W-1:0] 				total_len_dense_matrix,
+-	input 	logic [AXI_ADDR_W-1:0] 				ar_addr_comp_idx,
+-	input 	logic [AXI_ADDR_W-1:0] 				total_len_comp_idx,
+-	input 	logic [AXI_ADDR_W-1:0] 				ar_addr_idx,
+-	input 	logic [AXI_ADDR_W-1:0] 				total_len_idx,
+-	input	logic								rst_n_multi_burst,
+-    output 	logic              					axi_rd_available,  	// Disponibile ad accettare una nuova richiesta
+-	output 	logic              					axi_rd_done,		// Ultimo dato arrivato
+-	input	logic								axi_rd_done_rst_n, // From CU
+-	// Interfaccia con l'esterno		
+-	output 	logic [AXI_ADDR_W-1:0] 				ar_addr_out,
+-	output 	logic [7:0]        					ar_len_out,
+-	output 	logic [2:0]        					ar_size_out,
+-	input 	logic [AXI_DATA_SIZE-1:0] 			data_in,
+-	// Canale AR		
+-    output 	logic              					ar_valid,
+-    input  	logic              					ar_ready,
+-    output 	logic [1:0]        					ar_burst,
+-    // Canale R		
+-    input  	logic              					r_valid,
+-    output 	logic              					r_ready,
+-    input  	logic              					r_last,
+-			
+-	// INTERFACCIA FIFO		
+-	input  	logic                   			fifo_r_en, // From CU
+-	input	logic                   			fifo_rst_n,// From CU     
+-    output 	logic                   			fifo_empty,     
+-			
+-	// INTERFACCIA MEMORIA		
+-	input	logic                   			mem_rst_n, // From CU
+-	input	logic 								mem_wr_en, // From CU
+-	input	logic 								mem_idx_wr_en, // From CU
+-	input	logic 								mem_idx_mem_en, // From CU
+-			
+-	// INTERFACCIA BUFFER 		
+-	input	logic                   			buffer_rst_n, // From CU
+-	input  	logic                				buffer_data_in_valid, // From CU
+-    input  	logic                				buffer_data_in_last, // From CU
+-	output 	logic                				buffer_wait_wr,
+-	output	logic								buffer_data_out_valid,
+-			
+-	// INTERFACCIA AXI4 WRITE		
+-	input  	logic 								axi_wr_rst_n,      // From CU
+-	output 	logic              					axi_wr_done,		
+-	input	logic								axi_wr_done_rst_n, // From CU
+-	input	logic [2:0]        					axi_wr_aw_size_in, // From CU
+-	input	logic [AXI_ADDR_W-1:0] 				axi_wr_aw_addr_in, // From CU
+-	// Interfaccia con l'esterno		
+-    output 	logic [AXI_ADDR_W-1:0] 				aw_addr,
+-    output 	logic [7:0]        					aw_len,
+-    output 	logic [2:0]        					aw_size,
+-    output 	logic [1:0]        					aw_burst,
+-    output 	logic              					aw_valid,
+-    input  	logic              					aw_ready,
+-	// Canale W		
+-    output 	logic [AXI_DATA_SIZE-1:0] 			w_data,
+-    output 	logic [AXI_DATA_SIZE/8-1:0] 		w_strb,
+-    output 	logic              					w_valid,
+-    input  	logic              					w_ready,
+-    output 	logic              					w_last,
+-	// Canale B		
+-    input  	logic [1:0]        					b_resp,
+-    input  	logic              					b_valid,
+-    output 	logic              					b_ready,
+-	
+-	// INTERFACCIA ADDRESS MANAGER
+-	// Segnali di stato delle impostazioni del driver
+-	output 	logic 								tc_wr_mem,   // Fine scrittura della memoria densa
+-	output 	logic 								wr_index,	 // Scritura memoria degli indici compressi
+-	output 	logic 								tc_rd_index, // Lettura degli indici
+-	// Gestione indirizzi per la memoria a blocchi
+-	input	logic[AXI_ADDR_W-1:0]							status_reg_n_row,
+-	input 	logic											cnt_row_en,cnt_row_rst_n, // From CU
+-	input   logic											rd_b_mem, // From CU
+-	// Segnali PISO
+-	input	logic										piso_rst_n,piso_load,piso_shift_en, // From CU
+-	output	logic										piso_empty,
+-	input	logic										comp_idx_ptr_old_en,comp_idx_ptr_old_rst_n, // From CU
+-	input	logic										mux_comp_idx_sel, // From CU
+-	input 	logic										cnt_nnzs_en,cnt_nnzs_rst_n, // From CU
+-	output 	logic 										last_index, end_rd_index,
+-	output	logic										tc_nnzs,
+-	output  logic                               		next_row_empty,
+-	// Gestione blocco di SRAM per spMM
+-	input 	logic										cnt_stage_en,cnt_stage_rst_n,	// Si incrementa quando tc_nnzs = 1
+-	// Indicizzazione memoria degli indici
+-	input 	logic										cnt_comp_idx_en,cnt_comp_idx_rst_n  // From CU
+-);
+-
+-
+-// INTERFACCIA AXI4 READ
+-
+-
+-logic [AXI_DATA_SIZE-1:0] 	axi_rd_data_out;
+-logic						rd_done;
+-logic              			axi_rd_is_valid_data;  			// Un dato del burst è pronto per l'acceleratore
+-
+-// SEGNALI FIFO
+-logic 						fifo_rd;
+-logic [AXI_DATA_SIZE-1:0]  	fifo_r_data;
+-logic 						fifo_threshold;
+-
+-logic	piso_to_fifo_r_en;
+-
+-// SEGNALI MEMORIA
+-// Memoria matrice densa
+-logic [$clog2(NumWords)-1:0]				mem_addr;
+-logic [$clog2(AXI_DATA_SIZE/ByteWidth)-1:0]	mem_byte_sel;
+-logic [$clog2(N_BLOCKS)-1:0]				mem_mem_en;
+-logic [ByteWidth-1:0]						mem_data_out;
+-// Memoria indici compressi
+-logic [$clog2(NumWords_idx)-1:0]			mem_idx_addr;
+-logic [$clog2(AXI_DATA_SIZE/ByteWidth_idx)-1:0]	mem_idx_byte_sel;
+-logic [ByteWidth_idx-1:0]					mem_idx_data_out;
+-
+-// SEGNALI DOUBLE BUFFER
+-logic                		buffer_out_ready;
+-logic [AXI_DATA_SIZE-1:0]	buffer_data_out;
+-logic                		buffer_out_valid;
+-logic [7:0] 				buffer_rd_len;
+-logic [AXI_DATA_SIZE/8-1:0] buffer_wstrb_last;
+-
+-// INTERFACCIA AXI4 WRITE
+-logic						wr_done;
+-
+-
+-
+-address_manager #(
+-	.AXI_ADDR_W(AXI_ADDR_W),
+-	.NumWords(NumWords),
+-	.N_BLOCK_SRAM(N_BLOCKS),
+-	.WORD_SIZE(ByteWidth),
+-	.AXI_DATA_SIZE(AXI_DATA_SIZE),
+-	.NumWords_idx(NumWords_idx),   // Numero di word totali nella SRAM degli indici compressi
+-	.WORD_SIZE_IDX(ByteWidth_idx)   // Larghezza del singolo byte di indici compressi 
+-)i_address_manager(
+-	.clk(clk),
+-	.status_reg_n_row,
+-	.cnt_row_en,.cnt_row_rst_n,
+-	.rd_b_mem,
+-	.piso_rst_n,.load(piso_load),.shift_en(piso_shift_en),
+-	.empty(piso_empty),
+-	.is_spmm,
+-	.piso_data_in(fifo_r_data),
+-	.fifo_empty(fifo_empty),   
+-    .fifo_r_en(piso_to_fifo_r_en),    
+-	.byte_b_mem_out(mem_byte_sel),
+-	.addr_b_mem_out(mem_addr),
+-	.en_b_mem_out(mem_mem_en),			
+-	.comp_idx_in(mem_idx_data_out),                                 
+-	.comp_idx_ptr_old_en,.comp_idx_ptr_old_rst_n,  
+-	.mux_comp_idx_sel,
+-	.cnt_nnzs_en,.cnt_nnzs_rst_n,
+-	.last_index,.end_rd_index,
+-	.tc_nnzs,
+-	.next_row_empty(next_row_empty),
+-	.cnt_stage_en,.cnt_stage_rst_n,	
+-	.cnt_comp_idx_en,.cnt_comp_idx_rst_n,
+-	.cnt_comp_idx_out({mem_idx_addr,mem_idx_byte_sel})
+-);
+-
+-assign fifo_rd = (rd_b_mem == 1'b1) ? piso_to_fifo_r_en : fifo_r_en;
+-
+-
+-// IMPLEMENTAZIONE AXI4 WRITE
+-axi4_master_write #(
+-    .ADDR_W(AXI_ADDR_W),
+-    .DATA_W(AXI_DATA_SIZE)
+-)axi4_write(
+-    .clk_i(clk),
+-    .rst_ni(axi_wr_rst_n),
+-    .start(buffer_out_valid),
+-    .addr_in(axi_wr_aw_addr_in),
+-    .len_in(buffer_rd_len),
+-    .size_in(axi_wr_aw_size_in),
+-    .data_in(buffer_data_out),     // Dato da scrivere (es. da una FIFO)
+-    .w_strb_last(buffer_wstrb_last),
+-	.next_data_out(buffer_out_ready), // Richiesta nuovo dato per il burst
+-    .done(wr_done),
+-    .aw_addr,
+-    .aw_len,
+-    .aw_size,
+-    .aw_burst,
+-    .aw_valid,
+-    .aw_ready,
+-    .w_data,
+-    .w_strb,
+-    .w_valid,
+-    .w_ready,
+-    .w_last,
+-    .b_resp,
+-    .b_valid,
+-    .b_ready
+-);
+-
+-always_ff @(posedge clk or negedge rst_n) begin
+-	if (!rst_n) begin
+-		axi_wr_done <= 1'b0;
+-	end else begin
+-		if (!axi_wr_done_rst_n) begin // Diventa un clear sincrono controllato dalla CU
+-			axi_wr_done <= 1'b0;
+-		end else if (wr_done) begin
+-			axi_wr_done <= 1'b1;
+-		end
+-	end
+-end
+-
+-assign buffer_data_out_valid = buffer_out_valid;
+-
+-// IMPLEMENTAZIONE BUFFER PING-PONG
+-double_buffer_top #(
+-    .N_in(ByteWidth),
+-    .N_out(AXI_DATA_SIZE),
+-    .BIT_ADDR(BUFFER_BIT_ADDR)
+-)i_double_buffer_top(
+-    .clk(clk),
+-    .rst_n(buffer_rst_n),
+-    .data_in(mem_data_out),
+-    .data_in_valid(buffer_data_in_valid),
+-    .data_in_last(buffer_data_in_last),
+-    .wait_wr(buffer_wait_wr),
+-    .out_ready(buffer_out_ready),
+-    .data_out(buffer_data_out),
+-    .out_valid(buffer_out_valid),
+-	.wstrb_last(buffer_wstrb_last),
+-    .rd_len(buffer_rd_len)
+-);
+-
+-
+-// IMPLEMENTAZIONE MEMORIA
+-memory_unit #(
+-	.NumWords_idx(NumWords_idx),   	// Numero di word totali nella SRAM degli indici compressi
+-	.ByteWidth_idx(ByteWidth_idx),  // Larghezza del singolo byte di indici compressi 
+-    .NumWords(NumWords),   			// Numero di word totali nella SRAM singola
+-	.DataWidth(AXI_DATA_SIZE),   	// Larghezza del bus dati (64 bit)
+-	.ByteWidth(ByteWidth),    		// Larghezza del singolo byte 
+-	.NumPorts(NumPorts),    		// Numero di porte
+-	.Latency(Latency),    			// Latenza di lettura 
+-	.N_BLOCKS(N_BLOCKS)
+-)i_memory_unit(
+-    .clk_i(clk),
+-    .rst_ni(mem_rst_n),
+-    .addr(mem_addr),
+-	.byte_sel(mem_byte_sel),
+-	.data_in(fifo_r_data),
+-	.mem_en(mem_mem_en),
+-	.wr_en(mem_wr_en),
+-	.data_out(mem_data_out),
+-	.idx_addr(mem_idx_addr),
+-	.idx_byte_sel(mem_idx_byte_sel),
+-	.idx_data_in(fifo_r_data),
+-	.idx_mem_en(mem_idx_mem_en),
+-	.idx_wr_en(mem_idx_wr_en),
+-	.idx_data_out(mem_idx_data_out)
+-);
+-
+-
+-// IMPLEMENTAZIONE FIFO
+-fifo #(
+-    .DATA_WIDTH(AXI_DATA_SIZE),      
+-    .DEPTH(FIFO_DEPTH),      
+-	.THRESHOLD(FIFO_THRESHOLD)
+-)i_fifo(
+-    .clk(clk),      
+-    .rst_n(fifo_rst_n),    
+-    .w_en(axi_rd_is_valid_data),     
+-    .w_data(axi_rd_data_out), 
+-    .r_en(fifo_rd),
+-    .r_data(fifo_r_data),     
+-    .empty(fifo_empty),    
+-    .threshold(fifo_threshold)
+-);
+-
+-
+-// IMPLEMENTAZIONE AXI4 MASTER READ
+-axi4_master_read #(
+-    .ADDR_W(AXI_ADDR_W),
+-	.DATA_W(AXI_DATA_SIZE)
+-)axi4_read(
+-    .clk_i(clk),
+-    .rst_ni(axi_rd_rst_n),
+-    .start(axi_rd_start),
+-    .available(axi_rd_available),
+-	.ar_size_in,
+-	.ar_addr_dense_matrix(ar_addr_dense_matrix),
+-	.total_len_dense_matrix(total_len_dense_matrix),
+-	.ar_addr_comp_idx(ar_addr_comp_idx),
+-	.total_len_comp_idx(total_len_comp_idx),
+-	.ar_addr_idx(ar_addr_idx),
+-	.total_len_idx(total_len_idx),
+-	.rst_n_multi_burst(rst_n_multi_burst),
+-	.fifo_empty(fifo_empty),
+-	.tc_wr_mem(tc_wr_mem),   // Fine scrittura della memoria densa
+-	.wr_index(wr_index),	 // Scritura memoria degli indici compressi
+-	.tc_rd_index(tc_rd_index), // Lettura degli indici
+-	.ar_addr_out,
+-	.ar_len_out,
+-	.ar_size_out,
+-	.data_in,
+-	.data_out(axi_rd_data_out),
+-    .is_valid_data(axi_rd_is_valid_data),  		
+-    .done(rd_done),       	
+-	.fifo_full(fifo_threshold),	
+-    .ar_valid,
+-    .ar_ready,
+-    .ar_burst,
+-    .r_valid,
+-    .r_ready,
+-    .r_last
+-);
+-
+-always_ff @(posedge clk or negedge rst_n) begin // Reset hardware generale asincrono
+-	if (!rst_n) begin
+-		axi_rd_done <= 1'b0;
+-	end else begin
+-		if (!axi_rd_done_rst_n) begin // Diventa un clear sincrono perfetto gestito dalla CU
+-			axi_rd_done <= 1'b0;
+-		end else if (rd_done) begin
+-			axi_rd_done <= 1'b1;
+-		end
+-	end
+-end
+-
+-endmodule
++`timescale 1ns/1ps
++
++module accel_dp #(
++    parameter int unsigned AXI_ADDR_W = 32,
++    parameter int unsigned AXI_DATA_SIZE = 64,
++    parameter int FIFO_DEPTH = 16,
++    parameter int FIFO_THRESHOLD = 8,
++    parameter int unsigned NumWords_idx = 16,
++    parameter int unsigned ByteWidth_idx = 32,
++    parameter int unsigned NumWords = 16,
++    parameter int unsigned ByteWidth = 32,
++    parameter int unsigned NumPorts = 1,
++    parameter int unsigned Latency = 1,
++    parameter int N_BLOCKS = 8,
++    parameter int BUFFER_BIT_ADDR = 4,
++    parameter int PTR_FIFO_DEPTH = 4,
++    parameter int RESP_DEPTH = Latency + 2
++) (
++    input  logic clk,
++    input  logic rst_n,
++    input  logic is_spmm,
++
++    // AXI4 read control and external interface.
++    input  logic axi_rd_rst_n,
++    input  logic axi_rd_start,
++    input  logic [2:0] ar_size_in,
++    input  logic [AXI_ADDR_W-1:0] ar_addr_dense_matrix,
++    input  logic [AXI_ADDR_W-1:0] total_len_dense_matrix,
++    input  logic [AXI_ADDR_W-1:0] ar_addr_comp_idx,
++    input  logic [AXI_ADDR_W-1:0] total_len_comp_idx,
++    input  logic [AXI_ADDR_W-1:0] ar_addr_idx,
++    input  logic [AXI_ADDR_W-1:0] total_len_idx,
++    input  logic rst_n_multi_burst,
++    output logic axi_rd_available,
++    output logic axi_rd_done,
++    input  logic axi_rd_done_rst_n,
++    output logic [AXI_ADDR_W-1:0] ar_addr_out,
++    output logic [7:0] ar_len_out,
++    output logic [2:0] ar_size_out,
++    input  logic [AXI_DATA_SIZE-1:0] data_in,
++    output logic ar_valid,
++    input  logic ar_ready,
++    output logic [1:0] ar_burst,
++    input  logic r_valid,
++    output logic r_ready,
++    input  logic r_last,
++
++    // Shared AXI-read FIFO.
++    input  logic fifo_r_en,
++    input  logic fifo_rst_n,
++    output logic fifo_empty,
++
++    // Internal memories and pipelined dense read.
++    input  logic mem_rst_n,
++    input  logic mem_wr_en,
++    input  logic mem_idx_wr_en,
++    input  logic dense_rd_req,
++    output logic dense_req_ready,
++    output logic dense_pipe_empty,
++
++    // Output packing and double buffer.
++    input  logic buffer_rst_n,
++    input  logic buffer_data_in_last,
++    output logic buffer_wait_wr,
++    output logic buffer_data_out_valid,
++
++    // AXI4 write control and external interface.
++    input  logic axi_wr_rst_n,
++    output logic axi_wr_done,
++    input  logic axi_wr_done_rst_n,
++    input  logic [2:0] axi_wr_aw_size_in,
++    input  logic [AXI_ADDR_W-1:0] axi_wr_aw_addr_in,
++    output logic [AXI_ADDR_W-1:0] aw_addr,
++    output logic [7:0] aw_len,
++    output logic [2:0] aw_size,
++    output logic [1:0] aw_burst,
++    output logic aw_valid,
++    input  logic aw_ready,
++    output logic [AXI_DATA_SIZE-1:0] w_data,
++    output logic [AXI_DATA_SIZE/8-1:0] w_strb,
++    output logic w_valid,
++    input  logic w_ready,
++    output logic w_last,
++    input  logic [1:0] b_resp,
++    input  logic b_valid,
++    output logic b_ready,
++
++    // Read-master phase status.
++    output logic tc_wr_mem,
++    output logic wr_index,
++    output logic tc_rd_index,
++
++    // Dense preload address manager.
++    input  logic [AXI_ADDR_W-1:0] status_reg_n_row,
++    input  logic cnt_row_en,
++    input  logic cnt_row_rst_n,
++    input  logic rd_b_mem,
++
++    // PISO and pointer-look-ahead controls.
++    input  logic piso_rst_n,
++    input  logic piso_load,
++    input  logic piso_shift_en,
++    output logic piso_empty,
++    input  logic ptr_stream_enable,
++    input  logic ptr_stream_rst_n,
++    input  logic segment_advance,
++    output logic segment_valid,
++    output logic segment_done,
++    output logic stream_end,
++    output logic end_rd_index,
++    output logic next_row_empty,
++
++    // SpMM dense-bank stage.
++    input  logic cnt_stage_en,
++    input  logic cnt_stage_rst_n,
++
++    // Compressed-pointer preload address.
++    input  logic cnt_comp_idx_en,
++    input  logic cnt_comp_idx_rst_n
++);
++
++localparam int RESP_PTR_W = $clog2(RESP_DEPTH);
++localparam int RESP_COUNT_W = $clog2(RESP_DEPTH + 1);
++
++logic [AXI_DATA_SIZE-1:0] axi_rd_data_out;
++logic rd_done;
++logic axi_rd_is_valid_data;
++
++logic fifo_rd;
++logic [AXI_DATA_SIZE-1:0] fifo_r_data;
++logic fifo_threshold;
++logic piso_to_fifo_r_en;
++
++logic [$clog2(NumWords)-1:0] mem_addr;
++logic [$clog2(AXI_DATA_SIZE/ByteWidth)-1:0] mem_byte_sel;
++logic [$clog2(N_BLOCKS)-1:0] mem_mem_en;
++logic [ByteWidth-1:0] mem_data_out;
++logic dense_rsp_valid;
++
++logic [$clog2(NumWords_idx)-1:0] mem_idx_addr;
++logic [$clog2(AXI_DATA_SIZE/ByteWidth_idx)-1:0] mem_idx_byte_sel;
++logic [ByteWidth_idx-1:0] mem_idx_data_out;
++logic ptr_rd_req;
++logic ptr_rsp_valid;
++
++logic buffer_out_ready;
++logic [AXI_DATA_SIZE-1:0] buffer_data_out;
++logic buffer_out_valid;
++logic [7:0] buffer_rd_len;
++logic [AXI_DATA_SIZE/8-1:0] buffer_wstrb_last;
++logic buffer_value_valid;
++logic [ByteWidth-1:0] buffer_value_data;
++
++logic wr_done;
++
++// ========================================================
++// Address generation, PISO, and pointer look-ahead
++// ========================================================
++
++address_manager #(
++    .AXI_ADDR_W(AXI_ADDR_W),
++    .NumWords(NumWords),
++    .N_BLOCK_SRAM(N_BLOCKS),
++    .WORD_SIZE(ByteWidth),
++    .AXI_DATA_SIZE(AXI_DATA_SIZE),
++    .NumWords_idx(NumWords_idx),
++    .WORD_SIZE_IDX(ByteWidth_idx),
++    .PTR_FIFO_DEPTH(PTR_FIFO_DEPTH)
++) i_address_manager (
++    .clk,
++    .status_reg_n_row,
++    .cnt_row_en,
++    .cnt_row_rst_n,
++    .rd_b_mem,
++    .addr_b_mem_out(mem_addr),
++    .byte_b_mem_out(mem_byte_sel),
++    .en_b_mem_out(mem_mem_en),
++    .piso_rst_n,
++    .load(piso_load),
++    .shift_en(piso_shift_en),
++    .empty(piso_empty),
++    .fifo_empty,
++    .fifo_r_en(piso_to_fifo_r_en),
++    .is_spmm,
++    .piso_data_in(fifo_r_data),
++    .ptr_stream_enable,
++    .ptr_stream_rst_n,
++    .ptr_rd_req,
++    .ptr_rsp_valid,
++    .comp_idx_in(mem_idx_data_out),
++    .segment_advance,
++    .nnz_issue(dense_rd_req),
++    .segment_valid,
++    .segment_done,
++    .stream_end,
++    .end_rd_index,
++    .next_row_empty,
++    .cnt_stage_en,
++    .cnt_stage_rst_n,
++    .cnt_comp_idx_en,
++    .cnt_comp_idx_rst_n,
++    .cnt_comp_idx_out({mem_idx_addr, mem_idx_byte_sel})
++);
++
++assign fifo_rd = rd_b_mem ? piso_to_fifo_r_en : fifo_r_en;
++
++// ========================================================
++// Dense SRAM response queue
++// ========================================================
++
++logic [ByteWidth-1:0] rsp_mem [0:RESP_DEPTH-1];
++logic [RESP_PTR_W-1:0] rsp_wr_ptr_q;
++logic [RESP_PTR_W-1:0] rsp_rd_ptr_q;
++logic [RESP_COUNT_W-1:0] rsp_count_q;
++logic [RESP_COUNT_W-1:0] reserved_count_q;
++logic rsp_push;
++logic rsp_pop;
++
++assign rsp_push = dense_rsp_valid;
++assign rsp_pop = (rsp_count_q != '0) && !buffer_wait_wr;
++
++// reserved_count_q includes queued and still-in-flight SRAM responses.  A
++// request is accepted only when a response slot has already been reserved.
++assign dense_req_ready =
++    (reserved_count_q < RESP_COUNT_W'(RESP_DEPTH)) || rsp_pop;
++assign dense_pipe_empty = (reserved_count_q == '0);
++
++assign buffer_value_valid = rsp_pop;
++assign buffer_value_data = rsp_mem[rsp_rd_ptr_q];
++
++always_ff @(posedge clk or negedge buffer_rst_n) begin
++    if (!buffer_rst_n) begin
++        rsp_wr_ptr_q <= '0;
++        rsp_rd_ptr_q <= '0;
++        rsp_count_q <= '0;
++        reserved_count_q <= '0;
++        for (int unsigned i = 0; i < RESP_DEPTH; i++) begin
++            rsp_mem[i] <= '0;
++        end
++    end else begin
++        if (rsp_push) begin
++            rsp_mem[rsp_wr_ptr_q] <= mem_data_out;
++            if (rsp_wr_ptr_q == RESP_PTR_W'(RESP_DEPTH-1)) begin
++                rsp_wr_ptr_q <= '0;
++            end else begin
++                rsp_wr_ptr_q <= rsp_wr_ptr_q + 1'b1;
++            end
++        end
++
++        if (rsp_pop) begin
++            if (rsp_rd_ptr_q == RESP_PTR_W'(RESP_DEPTH-1)) begin
++                rsp_rd_ptr_q <= '0;
++            end else begin
++                rsp_rd_ptr_q <= rsp_rd_ptr_q + 1'b1;
++            end
++        end
++
++        unique case ({rsp_push, rsp_pop})
++            2'b10: rsp_count_q <= rsp_count_q + 1'b1;
++            2'b01: rsp_count_q <= rsp_count_q - 1'b1;
++            default: rsp_count_q <= rsp_count_q;
++        endcase
++
++        unique case ({dense_rd_req, rsp_pop})
++            2'b10: reserved_count_q <= reserved_count_q + 1'b1;
++            2'b01: reserved_count_q <= reserved_count_q - 1'b1;
++            default: reserved_count_q <= reserved_count_q;
++        endcase
++    end
++end
++
++// ========================================================
++// AXI4 write and double buffer
++// ========================================================
++
++axi4_master_write #(
++    .ADDR_W(AXI_ADDR_W),
++    .DATA_W(AXI_DATA_SIZE)
++) axi4_write (
++    .clk_i(clk),
++    .rst_ni(axi_wr_rst_n),
++    .start(buffer_out_valid),
++    .addr_in(axi_wr_aw_addr_in),
++    .len_in(buffer_rd_len),
++    .size_in(axi_wr_aw_size_in),
++    .data_in(buffer_data_out),
++    .w_strb_last(buffer_wstrb_last),
++    .next_data_out(buffer_out_ready),
++    .done(wr_done),
++    .aw_addr,
++    .aw_len,
++    .aw_size,
++    .aw_burst,
++    .aw_valid,
++    .aw_ready,
++    .w_data,
++    .w_strb,
++    .w_valid,
++    .w_ready,
++    .w_last,
++    .b_resp,
++    .b_valid,
++    .b_ready
++);
++
++always_ff @(posedge clk or negedge rst_n) begin
++    if (!rst_n) begin
++        axi_wr_done <= 1'b0;
++    end else if (!axi_wr_done_rst_n) begin
++        axi_wr_done <= 1'b0;
++    end else if (wr_done) begin
++        axi_wr_done <= 1'b1;
++    end
++end
++
++assign buffer_data_out_valid = buffer_out_valid;
++
++double_buffer_top #(
++    .N_in(ByteWidth),
++    .N_out(AXI_DATA_SIZE),
++    .BIT_ADDR(BUFFER_BIT_ADDR)
++) i_double_buffer_top (
++    .clk,
++    .rst_n(buffer_rst_n),
++    .data_in(buffer_value_data),
++    .data_in_valid(buffer_value_valid),
++    .data_in_last(buffer_data_in_last),
++    .wait_wr(buffer_wait_wr),
++    .out_ready(buffer_out_ready),
++    .data_out(buffer_data_out),
++    .out_valid(buffer_out_valid),
++    .wstrb_last(buffer_wstrb_last),
++    .rd_len(buffer_rd_len)
++);
++
++// ========================================================
++// Dense and pointer SRAMs
++// ========================================================
++
++memory_unit #(
++    .NumWords_idx(NumWords_idx),
++    .ByteWidth_idx(ByteWidth_idx),
++    .NumWords(NumWords),
++    .DataWidth(AXI_DATA_SIZE),
++    .ByteWidth(ByteWidth),
++    .NumPorts(NumPorts),
++    .Latency(Latency),
++    .N_BLOCKS(N_BLOCKS)
++) i_memory_unit (
++    .clk_i(clk),
++    .rst_ni(mem_rst_n),
++    .addr(mem_addr),
++    .byte_sel(mem_byte_sel),
++    .data_in(fifo_r_data),
++    .mem_en(mem_mem_en),
++    .wr_en(mem_wr_en),
++    .dense_rd_req,
++    .dense_rsp_valid,
++    .data_out(mem_data_out),
++    .idx_addr(mem_idx_addr),
++    .idx_byte_sel(mem_idx_byte_sel),
++    .idx_data_in(fifo_r_data),
++    .idx_wr_en(mem_idx_wr_en),
++    .ptr_rd_req,
++    .ptr_rsp_valid,
++    .idx_data_out(mem_idx_data_out)
++);
++
++// ========================================================
++// Shared FIFO and AXI4 read master
++// ========================================================
++
++fifo #(
++    .DATA_WIDTH(AXI_DATA_SIZE),
++    .DEPTH(FIFO_DEPTH),
++    .THRESHOLD(FIFO_THRESHOLD)
++) i_fifo (
++    .clk,
++    .rst_n(fifo_rst_n),
++    .w_en(axi_rd_is_valid_data),
++    .w_data(axi_rd_data_out),
++    .r_en(fifo_rd),
++    .r_data(fifo_r_data),
++    .empty(fifo_empty),
++    .threshold(fifo_threshold)
++);
++
++axi4_master_read #(
++    .ADDR_W(AXI_ADDR_W),
++    .DATA_W(AXI_DATA_SIZE)
++) axi4_read (
++    .clk_i(clk),
++    .rst_ni(axi_rd_rst_n),
++    .start(axi_rd_start),
++    .available(axi_rd_available),
++    .ar_size_in,
++    .ar_addr_dense_matrix,
++    .total_len_dense_matrix,
++    .ar_addr_comp_idx,
++    .total_len_comp_idx,
++    .ar_addr_idx,
++    .total_len_idx,
++    .rst_n_multi_burst,
++    .fifo_empty,
++    .tc_wr_mem,
++    .wr_index,
++    .tc_rd_index,
++    .ar_addr_out,
++    .ar_len_out,
++    .ar_size_out,
++    .data_in,
++    .data_out(axi_rd_data_out),
++    .is_valid_data(axi_rd_is_valid_data),
++    .done(rd_done),
++    .fifo_full(fifo_threshold),
++    .ar_valid,
++    .ar_ready,
++    .ar_burst,
++    .r_valid,
++    .r_ready,
++    .r_last
++);
++
++always_ff @(posedge clk or negedge rst_n) begin
++    if (!rst_n) begin
++        axi_rd_done <= 1'b0;
++    end else if (!axi_rd_done_rst_n) begin
++        axi_rd_done <= 1'b0;
++    end else if (rd_done) begin
++        axi_rd_done <= 1'b1;
++    end
++end
++
++// pragma translate_off
++initial begin : p_parameter_checks
++    assert (RESP_DEPTH >= (Latency + 2))
++        else $fatal(1, "RESP_DEPTH must be at least Latency+2");
++end
++
++assert property (@(posedge clk) disable iff (!rst_n || !buffer_rst_n)
++    dense_rd_req |-> dense_req_ready);
++
++assert property (@(posedge clk) disable iff (!rst_n || !buffer_rst_n)
++    rsp_count_q <= RESP_COUNT_W'(RESP_DEPTH));
++
++assert property (@(posedge clk) disable iff (!rst_n || !buffer_rst_n)
++    reserved_count_q <= RESP_COUNT_W'(RESP_DEPTH));
++
++assert property (@(posedge clk) disable iff (!rst_n || !buffer_rst_n)
++    rsp_count_q <= reserved_count_q);
++// pragma translate_on
++
++endmodule
+diff --git a/RTL/src/Gather/accel_top.sv b/RTL/src/Gather/accel_top.sv
+index 2355cdb..79b4233 100644
+--- a/RTL/src/Gather/accel_top.sv
++++ b/RTL/src/Gather/accel_top.sv
+@@ -1,200 +1,265 @@
+-`timescale 1ns/1ps
+-module accel_top #(
+-    parameter int unsigned AXI_ADDR_W        = 32,
+-    parameter int unsigned AXI_DATA_SIZE     = 64,
+-    parameter int FIFO_DEPTH                 = 4,
+-    parameter int FIFO_THRESHOLD             = 2,
+-    parameter int unsigned NumWords_idx      = 128,
+-    parameter int unsigned ByteWidth_idx     = 16,
+-    parameter int unsigned NumWords          = 128,
+-    parameter int unsigned ByteWidth         = 32,
+-    parameter int unsigned NumPorts          = 1,
+-    parameter int unsigned Latency           = 1,
+-    parameter int N_BLOCKS                   = 8,
+-    parameter int BUFFER_BIT_ADDR            = 3
+-)(
+-    input  logic                                clk,
+-    input  logic                                rst_n,
+-    input  logic                                start,
+-    input  logic                                is_spmm,
+-	output logic								done,
+-    
+-    // Interfaccia AXI4 Read (Verso l'esterno)
+-    input  logic [2:0]                          ar_size_in,
+-    output logic [AXI_ADDR_W-1:0]               ar_addr_out,
+-    output logic [7:0]                          ar_len_out,
+-    output logic [2:0]                          ar_size_out,
+-    input  logic [AXI_DATA_SIZE-1:0]            data_in,
+-    output logic                                ar_valid,
+-    input  logic                                ar_ready,
+-    output logic [1:0]                          ar_burst,
+-    input  logic                                r_valid,
+-    output logic                                r_ready,
+-    input  logic                                r_last,
+-
+-    // Interfaccia AXI4 Write (Verso l'esterno)
+-    input  logic [2:0]                          axi_wr_aw_size_in,
+-    input  logic [AXI_ADDR_W-1:0]               axi_wr_aw_addr_in,
+-    output logic [AXI_ADDR_W-1:0]               aw_addr,
+-    output logic [7:0]                          aw_len,
+-    output logic [2:0]                          aw_size,
+-    output logic [1:0]                          aw_burst,
+-    output logic                                aw_valid,
+-    input  logic                                aw_ready,
+-    output logic [AXI_DATA_SIZE-1:0]            w_data,
+-    output logic [AXI_DATA_SIZE/8-1:0]          w_strb,
+-    output logic                                w_valid,
+-    input  logic                                w_ready,
+-    output logic                                w_last,
+-    input  logic [1:0]                          b_resp,
+-    input  logic                                b_valid,
+-    output logic                                b_ready,
+-
+-    // Parametri e Impostazioni (Status Registers)
+-	input 	logic [AXI_ADDR_W-1:0] 				ar_addr_dense_matrix,
+-	input 	logic [AXI_ADDR_W-1:0] 				total_len_dense_matrix,
+-	input 	logic [AXI_ADDR_W-1:0] 				ar_addr_comp_idx,
+-	input 	logic [AXI_ADDR_W-1:0] 				total_len_comp_idx,
+-	input 	logic [AXI_ADDR_W-1:0] 				ar_addr_idx,
+-	input 	logic [AXI_ADDR_W-1:0] 				total_len_idx,
+-    input   logic [AXI_ADDR_W-1:0] 				status_reg_n_row
+-);
+-
+-// Segnali Interni di Collegamento
+-
+-// Segnali AXI Read
+-logic axi_rd_rst_n, axi_rd_start, axi_rd_available, axi_rd_done, axi_rd_done_rst_n;
+-logic rst_n_multi_burst, tc_wr_mem, wr_index, tc_rd_index;
+-
+-// Segnali FIFO 
+-logic fifo_r_en, fifo_rst_n, fifo_empty;
+-
+-// Segnali Memory 
+-logic mem_rst_n, mem_wr_en, mem_idx_wr_en, mem_idx_mem_en;
+-
+-// Segnali Buffer 
+-logic buffer_rst_n, buffer_data_in_valid, buffer_data_in_last, buffer_wait_wr, buffer_data_out_valid;
+-
+-// Segnali AXI Write 
+-logic axi_wr_rst_n, axi_wr_done, axi_wr_done_rst_n;
+-
+-// Segnali Address Manager 
+-logic cnt_row_en, cnt_row_rst_n, rd_b_mem;
+-logic piso_rst_n, piso_load, piso_shift_en, piso_empty;
+-logic comp_idx_ptr_old_en, comp_idx_ptr_old_rst_n, mux_comp_idx_sel;
+-logic cnt_nnzs_en, cnt_nnzs_rst_n, last_index, end_rd_index, tc_nnzs;
+-logic next_row_empty;
+-logic cnt_stage_en, cnt_stage_rst_n;
+-logic cnt_comp_idx_en, cnt_comp_idx_rst_n;
+-
+-// --- Istanza della CU ---
+-accel_cu i_accel_cu (
+-	.clk(clk), .rst_n(rst_n), .start(start),
+-	.* 
+-);
+-
+-// --- Istanza del DP ---
+-accel_dp #(
+-	.AXI_ADDR_W(AXI_ADDR_W),
+-	.AXI_DATA_SIZE(AXI_DATA_SIZE),
+-	.FIFO_DEPTH(FIFO_DEPTH),
+-	.FIFO_THRESHOLD(FIFO_THRESHOLD),
+-	.NumWords_idx(NumWords_idx),
+-	.ByteWidth_idx(ByteWidth_idx),
+-	.NumWords(NumWords),
+-	.ByteWidth(ByteWidth),
+-	.NumPorts(NumPorts),
+-	.Latency(Latency),
+-	.N_BLOCKS(N_BLOCKS),
+-	.BUFFER_BIT_ADDR(BUFFER_BIT_ADDR)
+-) i_accel_dp (
+-	.clk(clk),
+-	.rst_n(rst_n),
+-	.is_spmm(is_spmm),
+-	// AXI4 Read
+-	.axi_rd_rst_n(axi_rd_rst_n),
+-	.axi_rd_start(axi_rd_start),
+-	.ar_size_in(ar_size_in),
+-	.ar_addr_dense_matrix(ar_addr_dense_matrix),
+-	.total_len_dense_matrix(total_len_dense_matrix),
+-	.ar_addr_comp_idx(ar_addr_comp_idx),
+-	.total_len_comp_idx(total_len_comp_idx),
+-	.ar_addr_idx(ar_addr_idx),
+-	.total_len_idx(total_len_idx),
+-	.rst_n_multi_burst(rst_n_multi_burst),
+-	.tc_wr_mem(tc_wr_mem),   
+-	.wr_index(wr_index),	 
+-	.tc_rd_index(tc_rd_index), 
+-	.axi_rd_available(axi_rd_available),
+-	.axi_rd_done(axi_rd_done),
+-	.axi_rd_done_rst_n(axi_rd_done_rst_n),
+-	.ar_addr_out(ar_addr_out),
+-	.ar_len_out(ar_len_out),
+-	.ar_size_out(ar_size_out),
+-	.data_in(data_in),
+-	.ar_valid(ar_valid),
+-	.ar_ready(ar_ready),
+-	.ar_burst(ar_burst),
+-	.r_valid(r_valid),
+-	.r_ready(r_ready),
+-	.r_last(r_last),
+-	// FIFO
+-	.fifo_r_en(fifo_r_en),
+-	.fifo_rst_n(fifo_rst_n),
+-	.fifo_empty(fifo_empty),
+-	// Memory
+-	.mem_rst_n(mem_rst_n),
+-	.mem_wr_en(mem_wr_en),
+-	.mem_idx_wr_en(mem_idx_wr_en),
+-	.mem_idx_mem_en(mem_idx_mem_en), 
+-	// Buffer
+-	.buffer_rst_n(buffer_rst_n),
+-	.buffer_data_in_valid(buffer_data_in_valid),
+-	.buffer_data_in_last(buffer_data_in_last),
+-	.buffer_wait_wr(buffer_wait_wr),
+-	.buffer_data_out_valid(buffer_data_out_valid),
+-	// AXI4 Write
+-	.axi_wr_rst_n(axi_wr_rst_n),
+-	.axi_wr_done(axi_wr_done),
+-	.axi_wr_done_rst_n(axi_wr_done_rst_n),
+-	.axi_wr_aw_size_in(axi_wr_aw_size_in),
+-	.axi_wr_aw_addr_in(axi_wr_aw_addr_in),
+-	.aw_addr(aw_addr),
+-	.aw_len(aw_len),
+-	.aw_size(aw_size),
+-	.aw_burst(aw_burst),
+-	.aw_valid(aw_valid),
+-	.aw_ready(aw_ready),
+-	.w_data(w_data),
+-	.w_strb(w_strb),
+-	.w_valid(w_valid),
+-	.w_ready(w_ready),
+-	.w_last(w_last),
+-	.b_resp(b_resp),
+-	.b_valid(b_valid),
+-	.b_ready(b_ready),
+-	// Address Manager
+-	.status_reg_n_row(status_reg_n_row),
+-	.cnt_row_en(cnt_row_en),
+-	.cnt_row_rst_n(cnt_row_rst_n),
+-	.rd_b_mem(rd_b_mem),
+-	.piso_rst_n(piso_rst_n),
+-	.piso_load(piso_load),
+-	.piso_shift_en(piso_shift_en),
+-	.piso_empty(piso_empty),
+-	.comp_idx_ptr_old_en(comp_idx_ptr_old_en),
+-	.comp_idx_ptr_old_rst_n(comp_idx_ptr_old_rst_n),
+-	.mux_comp_idx_sel(mux_comp_idx_sel),
+-	.cnt_nnzs_en(cnt_nnzs_en),
+-	.cnt_nnzs_rst_n(cnt_nnzs_rst_n),
+-	.last_index(last_index),
+-	.end_rd_index(end_rd_index),
+-	.tc_nnzs(tc_nnzs),
+-	.next_row_empty(next_row_empty),
+-	.cnt_stage_en(cnt_stage_en),
+-	.cnt_stage_rst_n(cnt_stage_rst_n),
+-	.cnt_comp_idx_en(cnt_comp_idx_en),
+-	.cnt_comp_idx_rst_n(cnt_comp_idx_rst_n)
+-);
+-
+-endmodule
++`timescale 1ns/1ps
++
++module accel_top #(
++    parameter int unsigned AXI_ADDR_W = 32,
++    parameter int unsigned AXI_DATA_SIZE = 64,
++    parameter int FIFO_DEPTH = 4,
++    parameter int FIFO_THRESHOLD = 2,
++    parameter int unsigned NumWords_idx = 128,
++    parameter int unsigned ByteWidth_idx = 16,
++    parameter int unsigned NumWords = 128,
++    parameter int unsigned ByteWidth = 32,
++    parameter int unsigned NumPorts = 1,
++    parameter int unsigned Latency = 1,
++    parameter int N_BLOCKS = 8,
++    parameter int BUFFER_BIT_ADDR = 3,
++    parameter int PTR_FIFO_DEPTH = 4,
++    parameter int RESP_DEPTH = Latency + 2
++) (
++    input  logic clk,
++    input  logic rst_n,
++    input  logic start,
++    input  logic is_spmm,
++    output logic done,
++
++    // AXI4 read.
++    input  logic [2:0] ar_size_in,
++    output logic [AXI_ADDR_W-1:0] ar_addr_out,
++    output logic [7:0] ar_len_out,
++    output logic [2:0] ar_size_out,
++    input  logic [AXI_DATA_SIZE-1:0] data_in,
++    output logic ar_valid,
++    input  logic ar_ready,
++    output logic [1:0] ar_burst,
++    input  logic r_valid,
++    output logic r_ready,
++    input  logic r_last,
++
++    // AXI4 write.
++    input  logic [2:0] axi_wr_aw_size_in,
++    input  logic [AXI_ADDR_W-1:0] axi_wr_aw_addr_in,
++    output logic [AXI_ADDR_W-1:0] aw_addr,
++    output logic [7:0] aw_len,
++    output logic [2:0] aw_size,
++    output logic [1:0] aw_burst,
++    output logic aw_valid,
++    input  logic aw_ready,
++    output logic [AXI_DATA_SIZE-1:0] w_data,
++    output logic [AXI_DATA_SIZE/8-1:0] w_strb,
++    output logic w_valid,
++    input  logic w_ready,
++    output logic w_last,
++    input  logic [1:0] b_resp,
++    input  logic b_valid,
++    output logic b_ready,
++
++    // Status registers.
++    input  logic [AXI_ADDR_W-1:0] ar_addr_dense_matrix,
++    input  logic [AXI_ADDR_W-1:0] total_len_dense_matrix,
++    input  logic [AXI_ADDR_W-1:0] ar_addr_comp_idx,
++    input  logic [AXI_ADDR_W-1:0] total_len_comp_idx,
++    input  logic [AXI_ADDR_W-1:0] ar_addr_idx,
++    input  logic [AXI_ADDR_W-1:0] total_len_idx,
++    input  logic [AXI_ADDR_W-1:0] status_reg_n_row
++);
++
++logic axi_rd_rst_n;
++logic axi_rd_start;
++logic axi_rd_available;
++logic axi_rd_done;
++logic axi_rd_done_rst_n;
++logic rst_n_multi_burst;
++logic tc_wr_mem;
++logic wr_index;
++logic tc_rd_index;
++
++logic fifo_r_en;
++logic fifo_rst_n;
++logic fifo_empty;
++
++logic mem_rst_n;
++logic mem_wr_en;
++logic mem_idx_wr_en;
++logic dense_rd_req;
++logic dense_req_ready;
++logic dense_pipe_empty;
++
++logic buffer_rst_n;
++logic buffer_data_in_last;
++logic buffer_data_out_valid;
++
++logic axi_wr_rst_n;
++logic axi_wr_done;
++logic axi_wr_done_rst_n;
++
++logic cnt_row_en;
++logic cnt_row_rst_n;
++logic rd_b_mem;
++
++logic piso_rst_n;
++logic piso_load;
++logic piso_shift_en;
++logic piso_empty;
++
++logic ptr_stream_enable;
++logic ptr_stream_rst_n;
++logic segment_advance;
++logic segment_valid;
++logic segment_done;
++logic stream_end;
++logic end_rd_index;
++
++logic cnt_stage_en;
++logic cnt_stage_rst_n;
++logic cnt_comp_idx_en;
++logic cnt_comp_idx_rst_n;
++
++accel_cu i_accel_cu (
++    .clk,
++    .rst_n,
++    .start,
++    .done,
++    .axi_rd_rst_n,
++    .axi_rd_start,
++    .axi_rd_available,
++    .axi_rd_done,
++    .axi_rd_done_rst_n,
++    .fifo_r_en,
++    .fifo_rst_n,
++    .fifo_empty,
++    .mem_rst_n,
++    .mem_wr_en,
++    .mem_idx_wr_en,
++    .dense_rd_req,
++    .dense_req_ready,
++    .dense_pipe_empty,
++    .buffer_rst_n,
++    .buffer_data_in_last,
++    .buffer_data_out_valid,
++    .axi_wr_rst_n,
++    .axi_wr_done,
++    .axi_wr_done_rst_n,
++    .rst_n_multi_burst,
++    .tc_wr_mem,
++    .wr_index,
++    .tc_rd_index,
++    .cnt_row_en,
++    .cnt_row_rst_n,
++    .rd_b_mem,
++    .piso_rst_n,
++    .piso_load,
++    .piso_shift_en,
++    .piso_empty,
++    .ptr_stream_enable,
++    .ptr_stream_rst_n,
++    .segment_advance,
++    .segment_valid,
++    .segment_done,
++    .stream_end,
++    .end_rd_index,
++    .cnt_stage_en,
++    .cnt_stage_rst_n,
++    .cnt_comp_idx_en,
++    .cnt_comp_idx_rst_n
++);
++
++accel_dp #(
++    .AXI_ADDR_W(AXI_ADDR_W),
++    .AXI_DATA_SIZE(AXI_DATA_SIZE),
++    .FIFO_DEPTH(FIFO_DEPTH),
++    .FIFO_THRESHOLD(FIFO_THRESHOLD),
++    .NumWords_idx(NumWords_idx),
++    .ByteWidth_idx(ByteWidth_idx),
++    .NumWords(NumWords),
++    .ByteWidth(ByteWidth),
++    .NumPorts(NumPorts),
++    .Latency(Latency),
++    .N_BLOCKS(N_BLOCKS),
++    .BUFFER_BIT_ADDR(BUFFER_BIT_ADDR),
++    .PTR_FIFO_DEPTH(PTR_FIFO_DEPTH),
++    .RESP_DEPTH(RESP_DEPTH)
++) i_accel_dp (
++    .clk,
++    .rst_n,
++    .is_spmm,
++    .axi_rd_rst_n,
++    .axi_rd_start,
++    .ar_size_in,
++    .ar_addr_dense_matrix,
++    .total_len_dense_matrix,
++    .ar_addr_comp_idx,
++    .total_len_comp_idx,
++    .ar_addr_idx,
++    .total_len_idx,
++    .rst_n_multi_burst,
++    .axi_rd_available,
++    .axi_rd_done,
++    .axi_rd_done_rst_n,
++    .ar_addr_out,
++    .ar_len_out,
++    .ar_size_out,
++    .data_in,
++    .ar_valid,
++    .ar_ready,
++    .ar_burst,
++    .r_valid,
++    .r_ready,
++    .r_last,
++    .fifo_r_en,
++    .fifo_rst_n,
++    .fifo_empty,
++    .mem_rst_n,
++    .mem_wr_en,
++    .mem_idx_wr_en,
++    .dense_rd_req,
++    .dense_req_ready,
++    .dense_pipe_empty,
++    .buffer_rst_n,
++    .buffer_data_in_last,
++    .buffer_wait_wr(),
++    .buffer_data_out_valid,
++    .axi_wr_rst_n,
++    .axi_wr_done,
++    .axi_wr_done_rst_n,
++    .axi_wr_aw_size_in,
++    .axi_wr_aw_addr_in,
++    .aw_addr,
++    .aw_len,
++    .aw_size,
++    .aw_burst,
++    .aw_valid,
++    .aw_ready,
++    .w_data,
++    .w_strb,
++    .w_valid,
++    .w_ready,
++    .w_last,
++    .b_resp,
++    .b_valid,
++    .b_ready,
++    .tc_wr_mem,
++    .wr_index,
++    .tc_rd_index,
++    .status_reg_n_row,
++    .cnt_row_en,
++    .cnt_row_rst_n,
++    .rd_b_mem,
++    .piso_rst_n,
++    .piso_load,
++    .piso_shift_en,
++    .piso_empty,
++    .ptr_stream_enable,
++    .ptr_stream_rst_n,
++    .segment_advance,
++    .segment_valid,
++    .segment_done,
++    .stream_end,
++    .end_rd_index,
++    .next_row_empty(),
++    .cnt_stage_en,
++    .cnt_stage_rst_n,
++    .cnt_comp_idx_en,
++    .cnt_comp_idx_rst_n
++);
++
++endmodule
+diff --git a/RTL/src/Gather/address_manager.sv b/RTL/src/Gather/address_manager.sv
+index fe2f135..1dc7c32 100644
+--- a/RTL/src/Gather/address_manager.sv
++++ b/RTL/src/Gather/address_manager.sv
+@@ -1,213 +1,344 @@
+-`timescale 1ns/1ps
+-module address_manager #(
+-	parameter int AXI_ADDR_W				= 32,
+-	parameter int NumWords					= 16,	// Numero di word totali nella SRAM della matrice complessa
+-	parameter int N_BLOCK_SRAM				= 8,	// Numero di blocchi di memoria
+-	parameter int WORD_SIZE 				= 16,	// Dimensione della word
+-	parameter int AXI_DATA_SIZE  			= 64,	// Dimensione dei dati dall'esterno
+-	parameter int unsigned NumWords_idx		= 16,   // Numero di word totali nella SRAM degli indici compressi
+-	parameter int unsigned WORD_SIZE_IDX	= 32,   // Larghezza del singolo byte di indici compressi 
+-	// PARAMETRI DIPENDENTI
+-	parameter int unsigned WORDS_PER_LINE 		= $clog2(AXI_DATA_SIZE / WORD_SIZE),
+-	parameter int unsigned WORDS_PER_LINE_IDX	= $clog2(AXI_DATA_SIZE / WORD_SIZE_IDX)
+-)(
+-	input 	logic							clk,
+-	
+-	// Gestione indirizzi per la memoria a blocchi
+-	input	logic[AXI_ADDR_W-1:0]							status_reg_n_row,			// Registro di stato per il numero di word in un blocco (n_word-1)
+-	input 	logic											cnt_row_en,cnt_row_rst_n,	// Segnali Counter del numero di word per blocco
+-	input   logic											rd_b_mem,					// Switch tra lettura=1 e scrittura=0
+-	output	logic[($clog2(NumWords)-1):0] 					addr_b_mem_out,
+-	output	logic[WORDS_PER_LINE-1:0]						byte_b_mem_out,
+-	output	logic[($clog2(N_BLOCK_SRAM)-1):0]				en_b_mem_out,
+-	// Segnali PISO
+-	input	logic											piso_rst_n,load,shift_en,
+-	output	logic											empty,
+-	input   logic                    						fifo_empty,   // Segnale di FIFO vuota
+-    output  logic                    						fifo_r_en,    // Segnale di lettura per la FIFO
+-	
+-	input 	logic											is_spmm,					// Selettore dell'operazione
+-	
+-	input	logic[(AXI_DATA_SIZE-1):0]						piso_data_in,
+-	
+-	// Gestione valori non zeri per indici compressi(CSR -> riga, CSC -> colonna)
+-	input	logic [WORD_SIZE_IDX-1:0]		comp_idx_in,								// word degli indici in ingresso
+-	input	logic							comp_idx_ptr_old_en,comp_idx_ptr_old_rst_n, // Registro per il salvataggio del primo indice
+-	input	logic							mux_comp_idx_sel,							// Switch tra lettura nuovo intervallo oppure decremento
+-	input 	logic							cnt_nnzs_en,cnt_nnzs_rst_n,					// Counter dei valori non zero
+-	output 	logic 							last_index, end_rd_index,					// Segnali di stato dell'operazione di calcolo di valori non zero
+-	output	logic							tc_nnzs,									// Terminal Counter del Counter dei valori non zero
+-	output  logic                           next_row_empty,
+-	// Gestione blocco di SRAM per spMM
+-	input 	logic							cnt_stage_en,cnt_stage_rst_n,				// Aggiornamento del blocco memoria(solo spMM), si incrementa quando tc_nnzs = 1
+-	
+-	// Indicizzazione memoria degli indici
+-	input 	logic												cnt_comp_idx_en,cnt_comp_idx_rst_n, // Counter scrittura indirizzi della memoria indici
+-	output	logic [($clog2(NumWords_idx) + WORDS_PER_LINE_IDX)-1:0]	cnt_comp_idx_out				// Uscita indirizzo della memoria indici
+-
+-);
+-
+-localparam int ADDR_IDX_WIDTH = $clog2(NumWords_idx) + WORDS_PER_LINE_IDX;
+-localparam int MAX_VAL_IDX    = (NumWords_idx * (AXI_DATA_SIZE / WORD_SIZE_IDX)) - 1;
+-
+-logic [WORD_SIZE_IDX-1:0]		comp_idx_ptr_old_out;
+-logic [1:0][WORD_SIZE_IDX-1:0]	mux_comp_idx_ptr;
+-logic [WORD_SIZE_IDX-1:0]		cnt_nnzs_out;
+-
+-
+-logic [($clog2(NumWords_idx) + WORDS_PER_LINE_IDX)-1:0]	cnt_addr_idx_out;
+-logic [1:0][($clog2(NumWords_idx) + WORDS_PER_LINE_IDX)-1:0]	mux_comp_idx_addr;
+-
+-logic [$clog2(N_BLOCK_SRAM)-1:0]cnt_stage_out; 					// Puntatore al blocco di SRAM
+-
+-logic update_n_col;
+-logic [$clog2(NumWords)-1:0] cnt_row_out;
+-logic [($clog2(N_BLOCK_SRAM)-1):0] cnt_col_out;
+-
+-
+-
+-//========================================================
+-//	CALCOLO QUANTITà DI NON-ZERI
+-//========================================================
+-
+-always_ff @(posedge clk or negedge comp_idx_ptr_old_rst_n) begin
+-	if (!comp_idx_ptr_old_rst_n) begin
+-		comp_idx_ptr_old_out <= '0;
+-	end else if (comp_idx_ptr_old_en) begin
+-		comp_idx_ptr_old_out <= comp_idx_in;
+-	end
+-end
+-
+-assign next_row_empty = (comp_idx_in == comp_idx_ptr_old_out);
+-
+-assign mux_comp_idx_ptr[0] = comp_idx_in - comp_idx_ptr_old_out;
+-assign mux_comp_idx_ptr[1] = cnt_nnzs_out - 1'b1;
+-
+-always_ff @(posedge clk or negedge cnt_nnzs_rst_n) begin
+-	if (!cnt_nnzs_rst_n) begin
+-		cnt_nnzs_out <= '0;
+-	end else if (cnt_nnzs_en) begin
+-		cnt_nnzs_out <= mux_comp_idx_ptr[mux_comp_idx_sel];
+-	end
+-end
+-
+-assign tc_nnzs = (cnt_nnzs_out == '0);
+-// flag se sono finiti i puntatori
+-assign last_index = (comp_idx_in == '0);
+-
+-//========================================================
+-//	COUNTER DEGLI INDIRIZZI DEGLI INDICI COMPRESSI
+-//========================================================
+-always_ff @(posedge clk or negedge cnt_comp_idx_rst_n) begin
+-	if (!cnt_comp_idx_rst_n) begin
+-		cnt_addr_idx_out <= '0;
+-	end else if (cnt_comp_idx_en) begin
+-		cnt_addr_idx_out <= cnt_addr_idx_out + 1'b1;
+-	end
+-end
+-
+-assign mux_comp_idx_addr[0] = {cnt_addr_idx_out[0 +: $clog2(NumWords_idx)], {WORDS_PER_LINE_IDX{1'b0}}};
+-assign mux_comp_idx_addr[1] = cnt_addr_idx_out;
+-
+-assign cnt_comp_idx_out = mux_comp_idx_addr[rd_b_mem];
+-
+-assign end_rd_index = (cnt_addr_idx_out == ADDR_IDX_WIDTH'(MAX_VAL_IDX));
+-
+-//========================================================
+-//	COUNTER STAGE
+-//======================================================== 
+-always_ff @(posedge clk or negedge cnt_stage_rst_n) begin
+-	if (!cnt_stage_rst_n) begin
+-		cnt_stage_out <= '0;
+-	end else if (cnt_stage_en) begin
+-		cnt_stage_out <= cnt_stage_out + 1'b1;
+-	end
+-end
+-
+-//========================================================
+-//	COUNTER INDIRIZZAMENTO MATRICE DENSA
+-//======================================================== 
+-//counter row
+-always_ff @(posedge clk or negedge cnt_row_rst_n) begin
+-	if (!cnt_row_rst_n) begin
+-		cnt_row_out <= '0;
+-	end else if (update_n_col) begin
+-		cnt_row_out <= '0;
+-	end else if (cnt_row_en) begin
+-		cnt_row_out <= cnt_row_out + 1'b1;
+-	end
+-end
+-//counter col
+-always_ff @(posedge clk or negedge cnt_row_rst_n) begin
+-	if (!cnt_row_rst_n) begin
+-		cnt_col_out <= '0;
+-	end else if (update_n_col) begin
+-		cnt_col_out <= cnt_col_out + 1'b1;
+-	end
+-end
+-
+-assign update_n_col =(is_spmm == 1'b0) ? (cnt_row_en && (cnt_row_out == '1)) : (cnt_row_en && (cnt_row_out == status_reg_n_row[WORDS_PER_LINE +: $clog2(NumWords)]));
+-
+-//========================================================
+-//	SEGNALI ED ISTANZA DELLA PISO
+-//========================================================
+-
+-logic [WORD_SIZE_IDX-1:0] 				piso_data_out;
+-logic[($clog2(NumWords)-1):0] 			piso_addr_b_mem_out;
+-logic[WORDS_PER_LINE-1:0]				piso_byte_b_mem_out;
+-logic[($clog2(N_BLOCK_SRAM)-1):0]		piso_en_b_mem_out;
+-logic [1:0][($clog2(N_BLOCK_SRAM)-1):0]	mux_en_b_mem_spmm;
+-logic [1:0][($clog2(N_BLOCK_SRAM)-1):0]	mux_en_b_mem_rd_wr;
+-logic [1:0][($clog2(NumWords)-1):0]		mux_addr_b_mem;
+-// Istanza della PISO
+-piso #(
+-    .N_DATA_IN(AXI_DATA_SIZE),
+-	.WORD_SIZE(WORD_SIZE_IDX)
+-)i_piso(
+-    .clk(clk),
+-    .rst_n(piso_rst_n),
+-    .data_in(piso_data_in),    // Dato a 64 bit dal buffer 
+-    .load(load),       // Segnale per caricare il dato
+-    .shift_en(shift_en),   // Richiede la parola successiva
+-	.fifo_empty(fifo_empty),   // Segnale di FIFO vuota
+-    .fifo_r_en(fifo_r_en),    // Segnale di lettura per la FIFO
+-    .data_out(piso_data_out),   // Parola in uscita (max 32bit)
+-    .empty(empty)       // 1 quando tutti i dati sono stati inviati
+-);
+-
+-// Controllo della lunghezza di piso_data_out_extended
+-localparam int REQ_WIDTH = WORDS_PER_LINE + $clog2(NumWords) + $clog2(N_BLOCK_SRAM);
+-localparam int EXT_WIDTH = (WORD_SIZE_IDX > REQ_WIDTH) ? WORD_SIZE_IDX : REQ_WIDTH;
+-
+-logic [EXT_WIDTH-1:0] piso_data_out_extended;
+-assign piso_data_out_extended = EXT_WIDTH'(piso_data_out);
+-
+-// Divisione uscita dalla piso in (blocco,indirizzo,byte)
+-assign piso_byte_b_mem_out = piso_data_out_extended[0 +: WORDS_PER_LINE];
+-assign piso_addr_b_mem_out = piso_data_out_extended[WORDS_PER_LINE +: $clog2(NumWords)];
+-assign piso_en_b_mem_out = piso_data_out_extended[(WORDS_PER_LINE + $clog2(NumWords)) +: $clog2(N_BLOCK_SRAM)];
+-
+-//========================================================
+-//	MUX INDIRIZZAMENTO BLOCCO DI MEMORIA
+-//======================================================== 
+-// Mux selezione del blocco per l'operazione spMM
+-assign mux_en_b_mem_spmm[0] = piso_en_b_mem_out;
+-assign mux_en_b_mem_spmm[1] = cnt_stage_out;
+-
+-// Mux selezione del blocco per Read/Write
+-assign mux_en_b_mem_rd_wr[0] = cnt_col_out;
+-assign mux_en_b_mem_rd_wr[1] = mux_en_b_mem_spmm[is_spmm];
+-
+-// Mux selezione dell'indirizzo per Read/Write
+-assign mux_addr_b_mem[0] = cnt_row_out;
+-assign mux_addr_b_mem[1] = piso_addr_b_mem_out;
+-
+-// Assegnazione uscite per l'indirizzamento della memoria densa
+-assign byte_b_mem_out = piso_byte_b_mem_out;
+-assign addr_b_mem_out = mux_addr_b_mem[rd_b_mem];
+-assign en_b_mem_out = mux_en_b_mem_rd_wr[rd_b_mem];
+-
+-
+-
+-
+-endmodule
++`timescale 1ns/1ps
++
++module address_manager #(
++    parameter int AXI_ADDR_W = 32,
++    parameter int NumWords = 16,
++    parameter int N_BLOCK_SRAM = 8,
++    parameter int WORD_SIZE = 16,
++    parameter int AXI_DATA_SIZE = 64,
++    parameter int unsigned NumWords_idx = 16,
++    parameter int unsigned WORD_SIZE_IDX = 32,
++    parameter int unsigned PTR_FIFO_DEPTH = 4,
++    // Dependent parameters.
++    parameter int unsigned WORDS_PER_LINE = $clog2(AXI_DATA_SIZE / WORD_SIZE),
++    parameter int unsigned WORDS_PER_LINE_IDX = $clog2(AXI_DATA_SIZE / WORD_SIZE_IDX)
++) (
++    input  logic clk,
++
++    // Dense SRAM write/read addressing.
++    input  logic [AXI_ADDR_W-1:0] status_reg_n_row,
++    input  logic cnt_row_en,
++    input  logic cnt_row_rst_n,
++    input  logic rd_b_mem,
++    output logic [$clog2(NumWords)-1:0] addr_b_mem_out,
++    output logic [WORDS_PER_LINE-1:0] byte_b_mem_out,
++    output logic [$clog2(N_BLOCK_SRAM)-1:0] en_b_mem_out,
++
++    // Column/row-index PISO.
++    input  logic piso_rst_n,
++    input  logic load,
++    input  logic shift_en,
++    output logic empty,
++    input  logic fifo_empty,
++    output logic fifo_r_en,
++    input  logic is_spmm,
++    input  logic [AXI_DATA_SIZE-1:0] piso_data_in,
++
++    // Compressed-pointer look-ahead stream.
++    input  logic ptr_stream_enable,
++    input  logic ptr_stream_rst_n,
++    output logic ptr_rd_req,
++    input  logic ptr_rsp_valid,
++    input  logic [WORD_SIZE_IDX-1:0] comp_idx_in,
++    input  logic segment_advance,
++    input  logic nnz_issue,
++    output logic segment_valid,
++    output logic segment_done,
++    output logic stream_end,
++    output logic end_rd_index,
++    output logic next_row_empty,
++
++    // Dense-bank selector for SpMM.
++    input  logic cnt_stage_en,
++    input  logic cnt_stage_rst_n,
++
++    // Pointer-SRAM write address during preload.
++    input  logic cnt_comp_idx_en,
++    input  logic cnt_comp_idx_rst_n,
++    output logic [($clog2(NumWords_idx) + WORDS_PER_LINE_IDX)-1:0] cnt_comp_idx_out
++);
++
++localparam int ADDR_IDX_WIDTH = $clog2(NumWords_idx) + WORDS_PER_LINE_IDX;
++localparam int MAX_VAL_IDX = (NumWords_idx * (AXI_DATA_SIZE / WORD_SIZE_IDX)) - 1;
++localparam int PTR_COUNT_W = $clog2(PTR_FIFO_DEPTH + 1);
++localparam int PTR_INDEX_W = $clog2(PTR_FIFO_DEPTH);
++
++logic [ADDR_IDX_WIDTH-1:0] cnt_addr_idx_out;
++logic [ADDR_IDX_WIDTH-1:0] ptr_req_index_q;
++logic [ADDR_IDX_WIDTH-1:0] load_ptr_addr;
++
++logic [WORD_SIZE_IDX-1:0] ptr_fifo [0:PTR_FIFO_DEPTH-1];
++logic [PTR_COUNT_W-1:0] ptr_count_q;
++logic [PTR_COUNT_W-1:0] ptr_inflight_q;
++logic [PTR_COUNT_W:0] ptr_reserved;
++logic ptr_limit_reached_q;
++logic ptr_seen_nonzero_q;
++logic ptr_push;
++logic ptr_pop;
++
++logic [WORD_SIZE_IDX-1:0] segment_remaining_q;
++logic segment_valid_q;
++
++logic [$clog2(N_BLOCK_SRAM)-1:0] cnt_stage_out;
++logic update_n_col;
++logic [$clog2(NumWords)-1:0] cnt_row_out;
++logic [$clog2(N_BLOCK_SRAM)-1:0] cnt_col_out;
++
++// ========================================================
++// Pointer preload address
++// ========================================================
++
++always_ff @(posedge clk or negedge cnt_comp_idx_rst_n) begin
++    if (!cnt_comp_idx_rst_n) begin
++        cnt_addr_idx_out <= '0;
++    end else if (cnt_comp_idx_en) begin
++        cnt_addr_idx_out <= cnt_addr_idx_out + 1'b1;
++    end
++end
++
++// During preload one complete AXI word is written per count.  During compute
++// ptr_req_index_q is a scalar pointer index: {SRAM address, lane}.
++assign load_ptr_addr = {
++    cnt_addr_idx_out[0 +: $clog2(NumWords_idx)],
++    {WORDS_PER_LINE_IDX{1'b0}}
++};
++assign cnt_comp_idx_out = rd_b_mem ? ptr_req_index_q : load_ptr_addr;
++
++// ========================================================
++// Pointer look-ahead FIFO
++// ========================================================
++
++assign ptr_reserved = (PTR_COUNT_W+1)'(ptr_count_q)
++                    + (PTR_COUNT_W+1)'(ptr_inflight_q);
++assign ptr_pop = segment_advance && segment_valid_q;
++assign ptr_push = ptr_rsp_valid;
++
++// The pointer SRAM never backpressures a request.  Reserve space for every
++// request before issuing it; a simultaneous segment pop returns one credit.
++assign ptr_rd_req = ptr_stream_enable
++                 && !ptr_limit_reached_q
++                 && ((ptr_reserved < (PTR_COUNT_W+1)'(PTR_FIFO_DEPTH)) || ptr_pop);
++
++always_ff @(posedge clk or negedge ptr_stream_rst_n) begin
++    if (!ptr_stream_rst_n) begin
++        ptr_req_index_q <= '0;
++        ptr_count_q <= '0;
++        ptr_inflight_q <= '0;
++        ptr_limit_reached_q <= 1'b0;
++        ptr_seen_nonzero_q <= 1'b0;
++        segment_remaining_q <= '0;
++        segment_valid_q <= 1'b0;
++        for (int unsigned i = 0; i < PTR_FIFO_DEPTH; i++) begin
++            ptr_fifo[i] <= '0;
++        end
++    end else begin
++        if (ptr_rd_req) begin
++            if (ptr_req_index_q == ADDR_IDX_WIDTH'(MAX_VAL_IDX)) begin
++                ptr_limit_reached_q <= 1'b1;
++            end else begin
++                ptr_req_index_q <= ptr_req_index_q + 1'b1;
++            end
++        end
++
++        unique case ({ptr_rd_req, ptr_rsp_valid})
++            2'b10: ptr_inflight_q <= ptr_inflight_q + 1'b1;
++            2'b01: ptr_inflight_q <= ptr_inflight_q - 1'b1;
++            default: ptr_inflight_q <= ptr_inflight_q;
++        endcase
++
++        if (ptr_rsp_valid && (comp_idx_in != '0)) begin
++            ptr_seen_nonzero_q <= 1'b1;
++        end
++
++        unique case ({ptr_pop, ptr_push})
++            2'b01: begin
++                ptr_fifo[PTR_INDEX_W'(ptr_count_q)] <= comp_idx_in;
++                ptr_count_q <= ptr_count_q + 1'b1;
++            end
++
++            2'b10: begin
++                for (int unsigned i = 0; i < PTR_FIFO_DEPTH-1; i++) begin
++                    ptr_fifo[i] <= ptr_fifo[i+1];
++                end
++                ptr_fifo[PTR_FIFO_DEPTH-1] <= '0;
++                ptr_count_q <= ptr_count_q - 1'b1;
++            end
++
++            2'b11: begin
++                for (int unsigned i = 0; i < PTR_FIFO_DEPTH-1; i++) begin
++                    ptr_fifo[i] <= ptr_fifo[i+1];
++                end
++                ptr_fifo[PTR_INDEX_W'(ptr_count_q-1'b1)] <= comp_idx_in;
++                ptr_count_q <= ptr_count_q;
++            end
++
++            default: ptr_count_q <= ptr_count_q;
++        endcase
++
++        // Load the difference of the first two prefetched pointers.  When a
++        // segment is popped, use ptr[2] immediately; therefore an empty row
++        // can be skipped every cycle once the FIFO is primed.
++        if (ptr_pop) begin
++            if (ptr_count_q >= PTR_COUNT_W'(3)) begin
++                segment_remaining_q <= ptr_fifo[2] - ptr_fifo[1];
++                segment_valid_q <= 1'b1;
++            end else if ((ptr_count_q == PTR_COUNT_W'(2)) && ptr_push) begin
++                segment_remaining_q <= comp_idx_in - ptr_fifo[1];
++                segment_valid_q <= 1'b1;
++            end else begin
++                segment_remaining_q <= '0;
++                segment_valid_q <= 1'b0;
++            end
++        end else if (!segment_valid_q) begin
++            if ((ptr_count_q == PTR_COUNT_W'(1)) && ptr_push) begin
++                segment_remaining_q <= comp_idx_in - ptr_fifo[0];
++                segment_valid_q <= 1'b1;
++            end else if (ptr_count_q >= PTR_COUNT_W'(2)) begin
++                segment_remaining_q <= ptr_fifo[1] - ptr_fifo[0];
++                segment_valid_q <= 1'b1;
++            end
++        end else if (nnz_issue) begin
++            segment_remaining_q <= segment_remaining_q - 1'b1;
++        end
++    end
++end
++
++assign segment_valid = segment_valid_q;
++assign segment_done = segment_valid_q && (segment_remaining_q == '0);
++
++// A zero after at least one non-zero cumulative pointer is the existing
++// padding sentinel used by the stimuli generator.
++assign stream_end = segment_valid_q
++                 && ptr_seen_nonzero_q
++                 && (ptr_fifo[1] == '0);
++
++// All-zero pointer streams have no distinguishable sentinel.  Preserve the
++// legacy safety bound and terminate after the configured pointer SRAM range.
++assign end_rd_index = ptr_limit_reached_q
++                   && (ptr_inflight_q == '0)
++                   && (ptr_count_q < PTR_COUNT_W'(2));
++
++assign next_row_empty = (ptr_count_q >= PTR_COUNT_W'(3))
++                     && (ptr_fifo[2] == ptr_fifo[1]);
++
++// ========================================================
++// Dense-bank stage counter
++// ========================================================
++
++always_ff @(posedge clk or negedge cnt_stage_rst_n) begin
++    if (!cnt_stage_rst_n) begin
++        cnt_stage_out <= '0;
++    end else if (cnt_stage_en) begin
++        cnt_stage_out <= cnt_stage_out + 1'b1;
++    end
++end
++
++// ========================================================
++// Dense SRAM preload address
++// ========================================================
++
++always_ff @(posedge clk or negedge cnt_row_rst_n) begin
++    if (!cnt_row_rst_n) begin
++        cnt_row_out <= '0;
++    end else if (update_n_col) begin
++        cnt_row_out <= '0;
++    end else if (cnt_row_en) begin
++        cnt_row_out <= cnt_row_out + 1'b1;
++    end
++end
++
++always_ff @(posedge clk or negedge cnt_row_rst_n) begin
++    if (!cnt_row_rst_n) begin
++        cnt_col_out <= '0;
++    end else if (update_n_col) begin
++        cnt_col_out <= cnt_col_out + 1'b1;
++    end
++end
++
++assign update_n_col = (is_spmm == 1'b0)
++                    ? (cnt_row_en && (cnt_row_out == '1))
++                    : (cnt_row_en
++                       && (cnt_row_out
++                           == status_reg_n_row[WORDS_PER_LINE +: $clog2(NumWords)]));
++
++// ========================================================
++// Column/row-index PISO and dense SRAM address decode
++// ========================================================
++
++logic [WORD_SIZE_IDX-1:0] piso_data_out;
++logic [$clog2(NumWords)-1:0] piso_addr_b_mem_out;
++logic [WORDS_PER_LINE-1:0] piso_byte_b_mem_out;
++logic [$clog2(N_BLOCK_SRAM)-1:0] piso_en_b_mem_out;
++logic [1:0][$clog2(N_BLOCK_SRAM)-1:0] mux_en_b_mem_spmm;
++logic [1:0][$clog2(N_BLOCK_SRAM)-1:0] mux_en_b_mem_rd_wr;
++logic [1:0][$clog2(NumWords)-1:0] mux_addr_b_mem;
++
++piso #(
++    .N_DATA_IN(AXI_DATA_SIZE),
++    .WORD_SIZE(WORD_SIZE_IDX)
++) i_piso (
++    .clk,
++    .rst_n(piso_rst_n),
++    .data_in(piso_data_in),
++    .load,
++    .shift_en,
++    .fifo_empty,
++    .fifo_r_en,
++    .data_out(piso_data_out),
++    .empty
++);
++
++localparam int REQ_WIDTH = WORDS_PER_LINE
++                         + $clog2(NumWords)
++                         + $clog2(N_BLOCK_SRAM);
++localparam int EXT_WIDTH = (WORD_SIZE_IDX > REQ_WIDTH)
++                         ? WORD_SIZE_IDX : REQ_WIDTH;
++
++logic [EXT_WIDTH-1:0] piso_data_out_extended;
++assign piso_data_out_extended = EXT_WIDTH'(piso_data_out);
++
++assign piso_byte_b_mem_out =
++    piso_data_out_extended[0 +: WORDS_PER_LINE];
++assign piso_addr_b_mem_out =
++    piso_data_out_extended[WORDS_PER_LINE +: $clog2(NumWords)];
++assign piso_en_b_mem_out =
++    piso_data_out_extended[
++        (WORDS_PER_LINE + $clog2(NumWords)) +: $clog2(N_BLOCK_SRAM)
++    ];
++
++assign mux_en_b_mem_spmm[0] = piso_en_b_mem_out;
++assign mux_en_b_mem_spmm[1] = cnt_stage_out;
++assign mux_en_b_mem_rd_wr[0] = cnt_col_out;
++assign mux_en_b_mem_rd_wr[1] = mux_en_b_mem_spmm[is_spmm];
++
++assign mux_addr_b_mem[0] = cnt_row_out;
++assign mux_addr_b_mem[1] = piso_addr_b_mem_out;
++
++assign byte_b_mem_out = piso_byte_b_mem_out;
++assign addr_b_mem_out = mux_addr_b_mem[rd_b_mem];
++assign en_b_mem_out = mux_en_b_mem_rd_wr[rd_b_mem];
++
++// pragma translate_off
++initial begin : p_parameter_checks
++    assert (PTR_FIFO_DEPTH >= 3)
++        else $fatal(1, "PTR_FIFO_DEPTH must be at least 3 for look-ahead");
++    assert ((AXI_DATA_SIZE % WORD_SIZE) == 0)
++        else $fatal(1, "AXI_DATA_SIZE must be a multiple of WORD_SIZE");
++    assert ((AXI_DATA_SIZE % WORD_SIZE_IDX) == 0)
++        else $fatal(1, "AXI_DATA_SIZE must be a multiple of WORD_SIZE_IDX");
++end
++
++assert property (@(posedge clk) disable iff (!ptr_stream_rst_n)
++    nnz_issue |-> segment_valid_q && (segment_remaining_q != '0));
++
++assert property (@(posedge clk) disable iff (!ptr_stream_rst_n)
++    !(nnz_issue && segment_advance));
++
++assert property (@(posedge clk) disable iff (!ptr_stream_rst_n)
++    ptr_rsp_valid |-> (ptr_inflight_q != '0));
++
++assert property (@(posedge clk) disable iff (!ptr_stream_rst_n)
++    ptr_count_q <= PTR_COUNT_W'(PTR_FIFO_DEPTH));
++// pragma translate_on
++
++endmodule
+diff --git a/RTL/src/Gather/memory_unit.sv b/RTL/src/Gather/memory_unit.sv
+index a9ebc13..6ba2a06 100644
+--- a/RTL/src/Gather/memory_unit.sv
++++ b/RTL/src/Gather/memory_unit.sv
+@@ -1,124 +1,189 @@
+-module memory_unit #(
+-	parameter int unsigned NumWords_idx	= 16,   // Numero di word totali nella SRAM degli indici compressi
+-	parameter int unsigned ByteWidth_idx= 32,    // Larghezza del singolo byte di indici compressi 
+-    parameter int unsigned NumWords  	= 16,   // Numero di word totali nella SRAM singola
+-	parameter int unsigned DataWidth 	= 64,   // Larghezza del bus dati (64 bit)
+-	parameter int unsigned ByteWidth 	= 32,    // Larghezza del singolo byte 
+-	parameter int unsigned NumPorts  	= 1,    // Numero di porte
+-	parameter int unsigned Latency   	= 1,    // Latenza di lettura 
+-	parameter int N_BLOCKS = 8
+-)(
+-    input  	logic                 	clk_i,
+-    input  	logic                 	rst_ni,
+-    // Memoria matrice densa
+-    input 	logic [$clog2(NumWords)-1:0]			addr,
+-	input	logic [$clog2(DataWidth/ByteWidth)-1:0]	byte_sel,
+-	input	logic [DataWidth-1:0]					data_in,
+-	input	logic [$clog2(N_BLOCKS)-1:0]			mem_en,
+-	input	logic 									wr_en,
+-	output	logic [ByteWidth-1:0]					data_out,
+-	// Memoria indici compressi
+-	input 	logic [$clog2(NumWords_idx)-1:0]			idx_addr,
+-	input	logic [$clog2(DataWidth/ByteWidth_idx)-1:0]	idx_byte_sel,
+-	input	logic [DataWidth-1:0]						idx_data_in,
+-	input	logic 										idx_mem_en,
+-	input	logic 										idx_wr_en,
+-	output	logic [ByteWidth_idx-1:0]					idx_data_out
+-);
+-localparam int unsigned WORDS_PER_LINE = DataWidth / ByteWidth;
+-localparam int unsigned BeWidth   = (DataWidth + ByteWidth - 32'd1) / ByteWidth; 
+-
+-localparam int unsigned INDEX_PER_LINE = DataWidth / ByteWidth_idx;
+-localparam int unsigned BeWidth_idx   = (DataWidth + ByteWidth_idx - 32'd1) / ByteWidth_idx;
+-
+-// Segnali interni della memoria della matrice densa
+-logic [BeWidth-1:0]				be_i;
+-logic [N_BLOCKS-1:0]			decoded_en;
+-logic [N_BLOCKS-1:0][DataWidth-1:0]						single_mem_data_out;
+-logic [N_BLOCKS-1:0][WORDS_PER_LINE-1:0][ByteWidth-1:0]	words_array;
+-logic [N_BLOCKS-1:0][ByteWidth-1:0]						single_mem_byte_out;
+-
+-// Segnali interni della memoria della matrice densa
+-logic [BeWidth_idx-1:0]						idx_be_i;
+-logic [INDEX_PER_LINE-1:0][ByteWidth_idx-1:0]	idx_mem_data_out;
+-
+-
+-//====================================================
+-//Decoder degli enable della memoria
+-//====================================================
+-always_comb begin
+-	decoded_en			= '0;
+-	decoded_en[mem_en] 	= 1'b1;
+-end
+-
+-//====================================================
+-// Istanza dei blocchi di memoria per la matrice densa
+-//====================================================
+-assign be_i = '1;
+-genvar i ;
+-generate
+-	for (i = 0; i < N_BLOCKS; i++) begin : gen_memory_blocks
+-		tc_sram #(
+-		.NumWords   (NumWords),
+-		.DataWidth  (DataWidth),
+-		.ByteWidth  (ByteWidth),
+-		.NumPorts   (NumPorts),
+-		.Latency    (Latency)
+-		) block_sram (
+-		.clk_i      (clk_i),
+-		.rst_ni     (rst_ni),
+-		.req_i      (decoded_en[i]),
+-		.we_i       (wr_en),
+-		.addr_i     (addr),
+-		.wdata_i    (data_in),
+-		.be_i       (be_i),
+-		.rdata_o    (single_mem_data_out[i][DataWidth-1:0])
+-		);
+-	end
+-endgenerate
+-
+-//==================================================================
+-// Istanza dei mux per la selezione della word dalla sram singola
+-//==================================================================
+-assign words_array = single_mem_data_out;
+-always_comb begin
+-    for (int j = 0; j < N_BLOCKS; j++) begin
+-        // Per ogni blocco i, seleziona la word indicata da byte_sel
+-        single_mem_byte_out[j] = words_array[j][byte_sel];
+-    end
+-end
+-
+-//==================================================================
+-// Istanza dei mux per la selezione della word dai blocchi di sram
+-//==================================================================
+-assign data_out = single_mem_byte_out[mem_en];
+-
+-
+-//==================================================================
+-// Istanza della memoria per gli indici compressi
+-//==================================================================
+-assign idx_be_i = '1;
+-
+-tc_sram #(
+-.NumWords   (NumWords_idx),
+-.DataWidth  (DataWidth),
+-.ByteWidth  (ByteWidth_idx),
+-.NumPorts   (NumPorts),
+-.Latency    (Latency)
+-) comp_idx_sram (
+-.clk_i      (clk_i),
+-.rst_ni     (rst_ni),
+-.req_i      (idx_mem_en),
+-.we_i       (idx_wr_en),
+-.addr_i     (idx_addr),
+-.wdata_i    (idx_data_in),
+-.be_i       (idx_be_i),
+-.rdata_o    (idx_mem_data_out)
+-);
+-
+-//==================================================================
+-// Istanza del mux per la selezione dell'indice compresso
+-//==================================================================
+-assign idx_data_out = idx_mem_data_out[idx_byte_sel];
+-
+-endmodule
++`timescale 1ns/1ps
++
++module memory_unit #(
++    parameter int unsigned NumWords_idx = 16,
++    parameter int unsigned ByteWidth_idx = 32,
++    parameter int unsigned NumWords = 16,
++    parameter int unsigned DataWidth = 64,
++    parameter int unsigned ByteWidth = 32,
++    parameter int unsigned NumPorts = 1,
++    parameter int unsigned Latency = 1,
++    parameter int unsigned N_BLOCKS = 8
++) (
++    input  logic clk_i,
++    input  logic rst_ni,
++
++    // Dense SRAM banks.
++    input  logic [$clog2(NumWords)-1:0] addr,
++    input  logic [$clog2(DataWidth/ByteWidth)-1:0] byte_sel,
++    input  logic [DataWidth-1:0] data_in,
++    input  logic [$clog2(N_BLOCKS)-1:0] mem_en,
++    input  logic wr_en,
++    input  logic dense_rd_req,
++    output logic dense_rsp_valid,
++    output logic [ByteWidth-1:0] data_out,
++
++    // Compressed-pointer SRAM.
++    input  logic [$clog2(NumWords_idx)-1:0] idx_addr,
++    input  logic [$clog2(DataWidth/ByteWidth_idx)-1:0] idx_byte_sel,
++    input  logic [DataWidth-1:0] idx_data_in,
++    input  logic idx_wr_en,
++    input  logic ptr_rd_req,
++    output logic ptr_rsp_valid,
++    output logic [ByteWidth_idx-1:0] idx_data_out
++);
++
++localparam int unsigned WORDS_PER_LINE = DataWidth / ByteWidth;
++localparam int unsigned INDEX_PER_LINE = DataWidth / ByteWidth_idx;
++localparam int unsigned BeWidth = (DataWidth + ByteWidth - 1) / ByteWidth;
++localparam int unsigned BeWidth_idx = (DataWidth + ByteWidth_idx - 1) / ByteWidth_idx;
++localparam int unsigned BANK_W = $clog2(N_BLOCKS);
++localparam int unsigned LANE_W = $clog2(WORDS_PER_LINE);
++localparam int unsigned IDX_LANE_W = $clog2(INDEX_PER_LINE);
++
++logic [BeWidth-1:0] be_i;
++logic [N_BLOCKS-1:0] decoded_en;
++logic [N_BLOCKS-1:0][NumPorts-1:0][DataWidth-1:0] single_mem_data_out;
++logic [N_BLOCKS-1:0][ByteWidth-1:0] single_mem_byte_out;
++
++logic [BeWidth_idx-1:0] idx_be_i;
++logic [NumPorts-1:0][DataWidth-1:0] idx_mem_data_out;
++
++logic [BANK_W-1:0] dense_bank_sel;
++logic [LANE_W-1:0] dense_lane_sel;
++logic [IDX_LANE_W-1:0] ptr_lane_sel;
++
++// A bank is requested only for a real write or a real dense read.  The
++// original implementation kept one bank permanently enabled and therefore
++// relied on duplicated reads to hide the SRAM latency.
++always_comb begin
++    decoded_en = '0;
++    if (wr_en || dense_rd_req) begin
++        decoded_en[mem_en] = 1'b1;
++    end
++end
++
++assign be_i = '1;
++
++for (genvar i = 0; i < N_BLOCKS; i++) begin : gen_memory_blocks
++    tc_sram #(
++        .NumWords(NumWords),
++        .DataWidth(DataWidth),
++        .ByteWidth(ByteWidth),
++        .NumPorts(NumPorts),
++        .Latency(Latency)
++    ) i_tc_sram (
++        .clk_i,
++        .rst_ni,
++        .req_i({NumPorts{decoded_en[i]}}),
++        .we_i({NumPorts{wr_en && decoded_en[i]}}),
++        .addr_i({NumPorts{addr}}),
++        .wdata_i({NumPorts{data_in}}),
++        .be_i({NumPorts{be_i}}),
++        .rdata_o(single_mem_data_out[i])
++    );
++end
++
++always_comb begin
++    for (int unsigned j = 0; j < N_BLOCKS; j++) begin
++        single_mem_byte_out[j] =
++            single_mem_data_out[j][0][dense_lane_sel*ByteWidth +: ByteWidth];
++    end
++end
++
++assign data_out = single_mem_byte_out[dense_bank_sel];
++
++assign idx_be_i = '1;
++
++tc_sram #(
++    .NumWords(NumWords_idx),
++    .DataWidth(DataWidth),
++    .ByteWidth(ByteWidth_idx),
++    .NumPorts(NumPorts),
++    .Latency(Latency)
++) i_comp_idx_sram (
++    .clk_i,
++    .rst_ni,
++    .req_i({NumPorts{idx_wr_en || ptr_rd_req}}),
++    .we_i({NumPorts{idx_wr_en}}),
++    .addr_i({NumPorts{idx_addr}}),
++    .wdata_i({NumPorts{idx_data_in}}),
++    .be_i({NumPorts{idx_be_i}}),
++    .rdata_o(idx_mem_data_out)
++);
++
++assign idx_data_out =
++    idx_mem_data_out[0][ptr_lane_sel*ByteWidth_idx +: ByteWidth_idx];
++
++// The SRAM has a fixed response latency and no response-ready signal.  Delay
++// bank/lane tags by exactly the same number of cycles as the SRAM data.
++generate
++    if (Latency == 0) begin : gen_zero_latency_tags
++        always_comb begin
++            dense_bank_sel = mem_en;
++            dense_lane_sel = byte_sel;
++            ptr_lane_sel = idx_byte_sel;
++            dense_rsp_valid = dense_rd_req;
++            ptr_rsp_valid = ptr_rd_req;
++        end
++    end else begin : gen_registered_tags
++        logic [BANK_W-1:0] dense_bank_q [0:Latency-1];
++        logic [LANE_W-1:0] dense_lane_q [0:Latency-1];
++        logic [IDX_LANE_W-1:0] ptr_lane_q [0:Latency-1];
++        logic dense_valid_q [0:Latency-1];
++        logic ptr_valid_q [0:Latency-1];
++
++        always_ff @(posedge clk_i or negedge rst_ni) begin
++            if (!rst_ni) begin
++                for (int unsigned k = 0; k < Latency; k++) begin
++                    dense_bank_q[k] <= '0;
++                    dense_lane_q[k] <= '0;
++                    ptr_lane_q[k] <= '0;
++                    dense_valid_q[k] <= 1'b0;
++                    ptr_valid_q[k] <= 1'b0;
++                end
++            end else begin
++                for (int unsigned k = 0; k < Latency-1; k++) begin
++                    dense_bank_q[k] <= dense_bank_q[k+1];
++                    dense_lane_q[k] <= dense_lane_q[k+1];
++                    ptr_lane_q[k] <= ptr_lane_q[k+1];
++                    dense_valid_q[k] <= dense_valid_q[k+1];
++                    ptr_valid_q[k] <= ptr_valid_q[k+1];
++                end
++
++                dense_bank_q[Latency-1] <= mem_en;
++                dense_lane_q[Latency-1] <= byte_sel;
++                ptr_lane_q[Latency-1] <= idx_byte_sel;
++                dense_valid_q[Latency-1] <= dense_rd_req;
++                ptr_valid_q[Latency-1] <= ptr_rd_req;
++            end
++        end
++
++        always_comb begin
++            dense_bank_sel = dense_bank_q[0];
++            dense_lane_sel = dense_lane_q[0];
++            ptr_lane_sel = ptr_lane_q[0];
++            dense_rsp_valid = dense_valid_q[0];
++            ptr_rsp_valid = ptr_valid_q[0];
++        end
++    end
++endgenerate
++
++// pragma translate_off
++initial begin : p_parameter_checks
++    assert (DataWidth % ByteWidth == 0)
++        else $fatal(1, "DataWidth must be a multiple of ByteWidth");
++    assert (DataWidth % ByteWidth_idx == 0)
++        else $fatal(1, "DataWidth must be a multiple of ByteWidth_idx");
++    assert (N_BLOCKS > 1)
++        else $fatal(1, "memory_unit currently requires at least two dense banks");
++end
++
++assert property (@(posedge clk_i) disable iff (!rst_ni)
++    dense_rsp_valid |-> $past(dense_rd_req, Latency));
++
++assert property (@(posedge clk_i) disable iff (!rst_ni)
++    ptr_rsp_valid |-> $past(ptr_rd_req, Latency));
++// pragma translate_on
++
++endmodule
+diff --git a/RTL/src/Gather/sipo.sv b/RTL/src/Gather/sipo.sv
+index 27dec16..f227a84 100644
+--- a/RTL/src/Gather/sipo.sv
++++ b/RTL/src/Gather/sipo.sv
+@@ -1,4 +1,6 @@
+-module sipo #(
++`timescale 1ns/1ps
++
++module sipo #(
+     parameter int N_in  = 16,       // Larghezza della singola word
+     parameter int N_out = 64        // Larghezza totale in uscita
+ )(
+@@ -26,12 +28,13 @@ module sipo #(
+ 
+     // --- LOGICA DI SALVATAGGIO E CONTROLLO ---
+     always_ff @(posedge clk or negedge rst_n) begin
+-        if (!rst_n) begin
+-            for (int i = 0; i < NUM_STAGES; i++) pipe_regs[i] <= '0;
+-            count <= '0;
+-            wr_en <= 1'b0; // Reset del segnale di scrittura
+-			wr_strb <= '0;
+-        end else begin
++	        if (!rst_n) begin
++	            for (int i = 0; i < NUM_STAGES; i++) pipe_regs[i] <= '0;
++	            count <= '0;
++	            wr_en <= 1'b0; // Reset del segnale di scrittura
++				wr_strb <= '0;
++				last_out <= 1'b0;
++	        end else begin
+             if (!wait_wr) begin
+                 // Gestione dei dati
+                 if (data_in_valid) begin

@@ -1,3 +1,5 @@
+`timescale 1ns/1ps
+
 module sipo #(
     parameter int N_in  = 16,       // Larghezza della singola word
     parameter int N_out = 64        // Larghezza totale in uscita
@@ -26,12 +28,13 @@ module sipo #(
 
     // --- LOGICA DI SALVATAGGIO E CONTROLLO ---
     always_ff @(posedge clk or negedge rst_n) begin
-        if (!rst_n) begin
-            for (int i = 0; i < NUM_STAGES; i++) pipe_regs[i] <= '0;
-            count <= '0;
-            wr_en <= 1'b0; // Reset del segnale di scrittura
-			wr_strb <= '0;
-        end else begin
+	        if (!rst_n) begin
+	            for (int i = 0; i < NUM_STAGES; i++) pipe_regs[i] <= '0;
+	            count <= '0;
+	            wr_en <= 1'b0; // Reset del segnale di scrittura
+				wr_strb <= '0;
+				last_out <= 1'b0;
+	        end else begin
             if (!wait_wr) begin
                 // Gestione dei dati
                 if (data_in_valid) begin

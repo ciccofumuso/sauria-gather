@@ -27,6 +27,7 @@ module axi4_master_read #(
 	input 	logic [ADDR_W-1:0] 	total_len_comp_idx,
 	input 	logic [ADDR_W-1:0] 	ar_addr_idx,
 	input 	logic [ADDR_W-1:0] 	total_len_idx,
+	input 	logic [ADDR_W-1:0] 	effective_total_len_idx,
 	// Parametri in uscita verso lo slave
 	output 	logic [ADDR_W-1:0] ar_addr_out,
 	output 	logic [7:0]        ar_len_out,
@@ -233,6 +234,7 @@ end
 logic[ADDR_W-1:0] reg_len_out, sub_len_out;
 logic first_run, end_burst;
 logic[ADDR_W-1:0] reg_addr_out, add_addr_out;
+logic index_start_pending_q;
 
 
 always_comb begin
@@ -261,6 +263,16 @@ assign end_burst = (sub_len_out == '0);
 
 
 assign add_addr_out = reg_addr_out + ((32'(ar_len_out) + 32'd1) << ar_size_out);
+
+always_ff @(posedge clk_i or negedge rst_n_multi_burst) begin
+	if (!rst_n_multi_burst) begin
+		index_start_pending_q <= 1'b0;
+	end else if (done && end_burst && wr_index && !tc_wr_mem) begin
+		index_start_pending_q <= 1'b1;
+	end else if (start && index_start_pending_q) begin
+		index_start_pending_q <= 1'b0;
+	end
+end
 
 always_ff @(posedge clk_i  or negedge rst_n_multi_burst) begin
 	if (!rst_n_multi_burst) begin
@@ -305,8 +317,13 @@ always_ff @(posedge clk_i  or negedge rst_n_multi_burst) begin
 			if (waiting_for_fifo && fifo_empty) begin
 				reg_len_out      <= total_len_comp_idx;
 				reg_addr_out     <= ar_addr_comp_idx;
-				wr_index         <= 1'b1;   
-				waiting_for_fifo <= 1'b0;  
+				wr_index         <= 1'b1;
+				waiting_for_fifo <= 1'b0;
+			end
+
+			if (start && index_start_pending_q) begin
+				reg_len_out  <= effective_total_len_idx;
+				reg_addr_out <= ar_addr_idx;
 			end
 		end
 	end

@@ -137,10 +137,6 @@ always_comb begin
 		end
 		
 		WR_DATA: begin
-			// Do NOT use w_valid here: w_valid is assigned later in this same
-			// always_comb block, so reading it here uses the previous combinational
-			// value and causes the first accepted W beat to be ignored by the FSM.
-			// w_fire is the real current-cycle handshake.
 			if (w_fire) begin
 				if (is_last_beat) begin
 					cnt_en		= 1'b0;
