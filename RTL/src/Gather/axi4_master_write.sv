@@ -43,7 +43,7 @@ logic w_fire;
 
 assign aw_burst = 2'b01; // INCR
 assign next_data_out = data_req;
-assign w_fire = (current_state == WR_DATA) && start && w_ready;
+
 
 // Control Unit
 typedef enum logic [2:0] {
@@ -58,6 +58,7 @@ typedef enum logic [2:0] {
 state_e current_state, next_state;
 
 assign w_strb = (current_state == WR_DATA && is_last_beat) ? w_strb_last : '1;
+assign w_fire = (current_state == WR_DATA) && start && w_ready;
 
 always_ff @(posedge clk_i  or negedge rst_ni) begin
 	if (!rst_ni) begin

@@ -13,8 +13,7 @@ module accel_top #(
     parameter int unsigned Latency = 1,
     parameter int N_BLOCKS = 8,
     parameter int BUFFER_BIT_ADDR = 3,
-    parameter int PTR_FIFO_DEPTH = 4,
-    parameter int RESP_DEPTH = Latency + 2
+    parameter int PTR_FIFO_DEPTH = 4
 ) (
     input  logic clk,
     input  logic rst_n,
@@ -183,8 +182,7 @@ accel_dp #(
     .Latency(Latency),
     .N_BLOCKS(N_BLOCKS),
     .BUFFER_BIT_ADDR(BUFFER_BIT_ADDR),
-    .PTR_FIFO_DEPTH(PTR_FIFO_DEPTH),
-    .RESP_DEPTH(RESP_DEPTH)
+    .PTR_FIFO_DEPTH(PTR_FIFO_DEPTH)
 ) i_accel_dp (
     .clk,
     .rst_n,

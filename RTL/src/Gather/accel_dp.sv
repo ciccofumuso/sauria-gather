@@ -13,8 +13,7 @@ module accel_dp #(
     parameter int unsigned Latency = 1,
     parameter int N_BLOCKS = 8,
     parameter int BUFFER_BIT_ADDR = 4,
-    parameter int PTR_FIFO_DEPTH = 4,
-    parameter int RESP_DEPTH = Latency + 2
+    parameter int PTR_FIFO_DEPTH = 4
 ) (
     input  logic clk,
     input  logic rst_n,
@@ -120,11 +119,9 @@ module accel_dp #(
     input  logic cnt_comp_idx_rst_n
 );
 
-localparam int RESP_PTR_W = $clog2(RESP_DEPTH);
-localparam int RESP_COUNT_W = $clog2(RESP_DEPTH + 1);
+
 localparam int unsigned INDICES_PER_BEAT = AXI_DATA_SIZE / ByteWidth_idx;
-localparam int unsigned NNZ_COUNT_W =
-    AXI_ADDR_W + ((INDICES_PER_BEAT > 1) ? $clog2(INDICES_PER_BEAT) : 0);
+localparam int unsigned NNZ_COUNT_W = AXI_ADDR_W + ((INDICES_PER_BEAT > 1) ? $clog2(INDICES_PER_BEAT) : 0);
 
 logic [AXI_DATA_SIZE-1:0] axi_rd_data_out;
 logic rd_done;
@@ -293,11 +290,11 @@ assign fifo_rd = rd_b_mem ? piso_to_fifo_r_en : fifo_r_en;
 // Dense SRAM response queue
 // ========================================================
 
-logic [ByteWidth-1:0] rsp_mem [0:RESP_DEPTH-1];
-logic [RESP_PTR_W-1:0] rsp_wr_ptr_q;
-logic [RESP_PTR_W-1:0] rsp_rd_ptr_q;
-logic [RESP_COUNT_W-1:0] rsp_count_q;
-logic [RESP_COUNT_W-1:0] reserved_count_q;
+logic [ByteWidth-1:0] rsp_mem [0:1];
+logic rsp_wr_ptr_q;
+logic rsp_rd_ptr_q;
+logic [1:0] rsp_count_q;
+logic [1:0] reserved_count_q;
 logic rsp_push;
 logic rsp_pop;
 
@@ -305,7 +302,7 @@ assign rsp_push = dense_rsp_valid;
 assign rsp_pop = (rsp_count_q != '0) && !buffer_wait_wr;
 
 
-assign dense_req_ready = (reserved_count_q < RESP_COUNT_W'(RESP_DEPTH)) || rsp_pop;
+assign dense_req_ready = (reserved_count_q < 2'd2) || rsp_pop;
 assign dense_pipe_empty = (reserved_count_q == '0);
 
 assign buffer_value_valid = rsp_pop;
@@ -317,13 +314,13 @@ always_ff @(posedge clk or negedge buffer_rst_n) begin
         rsp_rd_ptr_q <= '0;
         rsp_count_q <= '0;
         reserved_count_q <= '0;
-        for (int unsigned i = 0; i < RESP_DEPTH; i++) begin
+        for (int unsigned i = 0; i < 2; i++) begin
             rsp_mem[i] <= '0;
         end
     end else begin
         if (rsp_push) begin
             rsp_mem[rsp_wr_ptr_q] <= mem_data_out;
-            if (rsp_wr_ptr_q == RESP_PTR_W'(RESP_DEPTH-1)) begin
+            if (rsp_wr_ptr_q == 1'b1) begin
                 rsp_wr_ptr_q <= '0;
             end else begin
                 rsp_wr_ptr_q <= rsp_wr_ptr_q + 1'b1;
@@ -331,7 +328,7 @@ always_ff @(posedge clk or negedge buffer_rst_n) begin
         end
 
         if (rsp_pop) begin
-            if (rsp_rd_ptr_q == RESP_PTR_W'(RESP_DEPTH-1)) begin
+            if (rsp_rd_ptr_q == 1'b1) begin
                 rsp_rd_ptr_q <= '0;
             end else begin
                 rsp_rd_ptr_q <= rsp_rd_ptr_q + 1'b1;
